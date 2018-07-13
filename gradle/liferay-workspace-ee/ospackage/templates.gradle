@@ -1,0 +1,192 @@
+/*
+ * Copyright (c) 2000-present Liferay, Inc. All rights reserved.
+ *
+ * The contents of this file are subject to the terms of the Liferay Enterprise
+ * Subscription License ("License"). You may not use this file except in
+ * compliance with the License. You can obtain a copy of the License by
+ * contacting Liferay, Inc. See the License for the specific language governing
+ * permissions and limitations under the License, including but not limited to
+ * distribution rights of the Software.
+ */
+
+import org.apache.tools.ant.filters.ReplaceTokens
+
+def templateFileConstantsPlaceholder = '{{constants_from_gradle}}'
+
+task generatePkgFilesFromTemplates(type: Copy) {
+
+    dependsOn checkBundleType
+
+    // we depend on lot of project properties as inputs, it would be not reliable
+    // to try to list them and the task is fast, so execute it always
+    outputs.upToDateWhen {
+        false
+    }
+
+    ext.sourceDir = 'templates'
+    ext.utilsFileContent = file('files/pkg_scripts/utils.sh').text.replace('#!/bin/sh', '')
+
+    /**
+     * Returns the handle to processed template (file after evaluation) based
+     * on given path inside this.sourceDir ('templates').
+     */
+    ext.getOutputFile = { String filePath ->
+        return file("${destinationDir}/${filePath}")
+    }
+
+    into "${buildDir}/pkg_files"
+
+    [
+            'tomcat'
+    ].each { supportedBundleType ->
+
+        // since the processed files are all shell scripts (full of $ shell variable references),
+        // rather not use 'expand', which would also try to replace all these $... variables.
+        // We would need to escape all shell variable references as \$...
+
+        "${sourceDir}/init.d/liferay-${supportedBundleType}.sh".with {
+            assert project.file(it).isFile(),
+                    "File '${it}' mising, was init.d template for app server type '${supportedBundleType}' added?"
+
+            from(it) {
+                into 'init.d'
+
+                filter(
+                        ReplaceTokens,
+                        tokens: [
+                                LIFERAY_SERVICE_NAME            : project.liferayServiceName,
+                                UTILS_FILE_CONTENT              : utilsFileContent,
+                                LIFERAY_USER                    : project.liferayUser,
+                                LIFERAY_GROUP                   : project.liferayGroup,
+                                LIFERAY_HOME                    : project.liferayHome,
+                                LIFERAY_HOME_APP_SERVER_DIR_NAME: gradle.liferayWorkspaceEe.bundleAppServerDirectoryName,
+                                JAVA_HOME                       : project.javaHome,
+                                HARDEN_BUNDLE_ON_START          : gradle.liferayWorkspaceEe.bundleHardenOnStart
+                        ].collectEntries { k,v -> [ k as String, v as String ] }
+                )
+            }
+        }
+
+        "${sourceDir}/logrotate.d/liferay-${supportedBundleType}".with {
+            assert project.file(it).isFile(),
+                    "File '${it}' mising, was logrotate.d template for app server type '${supportedBundleType}' added?"
+
+            // Tomcat one was created based on: https://dzone.com/articles/how-rotate-tomcat-catalinaout
+            from(it) {
+                into 'logrotate.d'
+
+                filter(
+                        ReplaceTokens,
+                        tokens: [
+                                LIFERAY_USER                    : project.liferayUser,
+                                LIFERAY_GROUP                   : project.liferayGroup,
+                                LIFERAY_HOME                    : project.liferayHome,
+                                LIFERAY_HOME_APP_SERVER_DIR_NAME: gradle.liferayWorkspaceEe.bundleAppServerDirectoryName
+                        ].collectEntries { k,v -> [ k as String, v as String ] }
+                )
+            }
+        }
+    }
+
+    from("${sourceDir}/pkg_scripts/install-liferay-bundle.sh") {
+        into 'pkg_scripts'
+
+        filter(
+                ReplaceTokens,
+                tokens: [
+                        UTILS_FILE_CONTENT              : utilsFileContent,
+                        LIFERAY_BUNDLE_ARCHIVE          : project.liferayBundleArchive,
+                        LIFERAY_USER                    : project.liferayUser,
+                        LIFERAY_GROUP                   : project.liferayGroup,
+                        LIFERAY_HOME                    : project.liferayHome,
+                        LIFERAY_HOME_DATA_DIR_NAME      : project.liferayHomeDataDirName,
+                        LIFERAY_HOME_APP_SERVER_DIR_NAME: gradle.liferayWorkspaceEe.bundleAppServerDirectoryName,
+                        APP_SERVER_VALIDATION_FILE_PATH : checkBundleType.bundleType.appServerValidationFile
+                ].collectEntries { k,v -> [ k as String, v as String ] }
+        )
+    }
+
+    from("${sourceDir}/pkg_scripts/add-liferay-user-and-group.sh") {
+        into 'pkg_scripts'
+
+        filter(
+                ReplaceTokens,
+                tokens: [
+                        UTILS_FILE_CONTENT: utilsFileContent,
+                        LIFERAY_USER      : project.liferayUser,
+                        LIFERAY_GROUP     : project.liferayGroup
+                ].collectEntries { k,v -> [ k as String, v as String ] }
+        )
+    }
+
+    from("${sourceDir}/pkg_scripts/enable-liferay-bundle-service.sh") {
+        into 'pkg_scripts'
+
+        filter(
+                ReplaceTokens,
+                tokens: [
+                        UTILS_FILE_CONTENT  : utilsFileContent,
+                        LIFERAY_SERVICE_NAME: project.liferayServiceName
+                ].collectEntries { k,v -> [ k as String, v as String ] }
+        )
+    }
+
+    from("${sourceDir}/pkg_scripts/install-oracle-jdk-x-linux-x64.sh") {
+        into 'pkg_scripts'
+
+        // make sure the jdk.versionMajor is in the target file's name
+        rename 'install-oracle-jdk-x-linux-x64.sh', "install-oracle-jdk-${project.jdk.versionMajor}-linux-x64.sh"
+
+        filter(
+                ReplaceTokens,
+                tokens: [
+                        UTILS_FILE_CONTENT                        : utilsFileContent,
+                        JDK_VERSION_MAJOR                         : project.jdk.versionMajor,
+                        JDK_DOWNLOAD_URL                          : project.jdk.download.url,
+                        JDK_DOWNLOAD_ARCHIVE_NAME                 : project.jdk.download.archiveName,
+                        JDK_DOWNLOAD_ARCHIVE_TOP_LEVEL_DIR        : project.jdk.download.archiveTopLevelDir,
+                        JDK_DOWNLOAD_ARCHIVE_MD5_CHECKSUM         : project.jdk.download.md5Checksum,
+                        JDK_INSTALLATION_SOURCE_ARCHIVE_PARENT_DIR: project.jdk.installation.sourceArchiveParentDir,
+                        JDK_INSTALLATION_PARENT_DIR               : project.jdk.installation.parentDir,
+                        JDK_INSTALLATION_SYMLINK_NAME             : project.jdk.installation.symlinkName
+                ].collectEntries { k,v -> [ k as String, v as String ] }
+        )
+    }
+
+    from("${sourceDir}/pkg_scripts/disable-liferay-bundle-service.sh") {
+        into 'pkg_scripts'
+
+        filter(
+                ReplaceTokens,
+                tokens: [
+                        UTILS_FILE_CONTENT  : utilsFileContent,
+                        LIFERAY_SERVICE_NAME: project.liferayServiceName
+                ].collectEntries { k,v -> [ k as String, v as String ] }
+        )
+    }
+
+    from("${sourceDir}/pkg_scripts/stop-liferay-bundle.sh") {
+        into 'pkg_scripts'
+
+        filter(
+                ReplaceTokens,
+                tokens: [
+                        UTILS_FILE_CONTENT  : utilsFileContent,
+                        LIFERAY_SERVICE_NAME: project.liferayServiceName
+                ].collectEntries { k,v -> [ k as String, v as String ] }
+        )
+    }
+
+    from("${sourceDir}/pkg_scripts/uninstall-liferay-bundle.sh") {
+        into 'pkg_scripts'
+
+        filter(
+                ReplaceTokens,
+                tokens: [
+                        UTILS_FILE_CONTENT        : utilsFileContent,
+                        LIFERAY_HOME              : project.liferayHome,
+                        LIFERAY_HOME_DATA_DIR_NAME: project.liferayHomeDataDirName
+                ].collectEntries { k,v -> [ k as String, v as String ] }
+        )
+    }
+}

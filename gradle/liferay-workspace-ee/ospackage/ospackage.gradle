@@ -1,0 +1,609 @@
+/*
+ * Copyright (c) 2000-present Liferay, Inc. All rights reserved.
+ *
+ * The contents of this file are subject to the terms of the Liferay Enterprise
+ * Subscription License ("License"). You may not use this file except in
+ * compliance with the License. You can obtain a copy of the License by
+ * contacting Liferay, Inc. See the License for the specific language governing
+ * permissions and limitations under the License, including but not limited to
+ * distribution rights of the Software.
+ */
+
+import com.netflix.gradle.plugins.deb.Deb
+import com.netflix.gradle.plugins.rpm.Rpm
+import de.undercouch.gradle.tasks.download.Download
+import de.undercouch.gradle.tasks.download.Verify
+import groovy.transform.TupleConstructor
+import org.redline_rpm.header.Architecture
+import org.redline_rpm.header.Os
+
+import org.gradle.api.logging.Logger
+
+plugins {
+    // https://github.com/nebula-plugins/gradle-ospackage-plugin
+    id 'nebula.ospackage-base' version '3.4.0'
+
+    // https://github.com/michel-kraemer/gradle-download-task
+    id "de.undercouch.download" version '3.1.2'
+}
+
+// Cache the JDK's download, follow the pattern of Liferay Workspace Plugin (it downloads
+// bundles into ~/.liferay/bundles).
+def jdksCacheDir = file("${System.getProperty('user.home')}/.liferay/oracle-jdks")
+
+// most commonly used JDKs - latest know from Oracle for given major version;
+// 7 and 8 are the only allowed values in gradle.liferayWorkspaceEe.javaVersionMajor
+// (see gradle/liferay-workspace-ee/liferay-workspace-ee.gradle where the property
+// 'liferay.workspace.ee.java.version.major' is being read and validated)
+//
+def downloadableOracleJdks = [7, 8].collectEntries { majorVersion ->
+    [
+            majorVersion,
+            [
+                    version           : findProperty("liferay.workspace.ee.ospackage.oracle.jdk.${majorVersion}.version"),
+                    url               : findProperty("liferay.workspace.ee.ospackage.oracle.jdk.${majorVersion}.url"),
+                    archiveName       : findProperty("liferay.workspace.ee.ospackage.oracle.jdk.${majorVersion}.archive.name"),
+                    archiveTopLevelDir: findProperty("liferay.workspace.ee.ospackage.oracle.jdk.${majorVersion}.top.level.dir"),
+                    md5Checksum       : findProperty("liferay.workspace.ee.ospackage.oracle.jdk.${majorVersion}.md5"),
+                    sha256Checksum    : findProperty("liferay.workspace.ee.ospackage.oracle.jdk.${majorVersion}.sha256"),
+            ]
+    ]
+}
+
+// Liferay Workspace by default works with Liferay 7.0 (DXP), which is JDK 8 only, but
+// we allow this to be overridden to JDK 7 to build bundles for Liferay 6.2
+
+def selectedJdkVersionMajor = gradle.liferayWorkspaceEe.javaVersionMajor
+
+// Initialize project properties used by 'bundle-types.gradle'
+ext {
+    distBundleTarTask = gradle.liferayWorkspaceEe.workspaceTasks.distBundleTar
+}
+
+// include the script first, since we need to use parsed bundle type retrieved from
+// task 'checkBundleType' in ext properties below
+apply from: 'bundle-types.gradle'
+
+ext {
+
+    // the Liferay Workspace extension is accessible as ${gradle.liferayWorkspace}:
+    // https://github.com/liferay/liferay-portal/blob/master/modules/sdk/gradle-plugins-workspace/src/main/java/com/liferay/gradle/plugins/workspace/WorkspaceExtension.java
+    currentEnvironmentName = gradle.liferayWorkspace.getEnvironment()
+
+    liferayBundleBuiltTarFile = distBundleTarTask.archivePath
+
+    //
+    // The description of how the DEB / RPM will download & install the JDK
+    //
+
+    jdk = [
+            versionMajor: selectedJdkVersionMajor as String,
+            version     : downloadableOracleJdks[selectedJdkVersionMajor].version as String,
+            download    : downloadableOracleJdks[selectedJdkVersionMajor],
+            installation: [
+                    // The path where JDKs will be placed into by the deb / rpm packages or
+                    // downloaded by the JDK installation script being generated
+                    sourceArchiveParentDir: '/opt/liferay',
+
+                    parentDir             : '/opt/liferay',
+                    symlinkName           : "oracle-jdk-${selectedJdkVersionMajor}" as String
+            ]
+    ]
+
+    // can be used by modules depending on this module (like 'docker')
+    javaHome = (
+            (gradle.liferayWorkspaceEe.ospackageJdkInstallationType
+                    in [ JdkInstallationType.ORACLE_JDK_BUNDLED.key, JdkInstallationType.ORACLE_JDK_DOWNLOADED_ON_INSTALL.key ]) ?
+                "${jdk.installation.parentDir}/${jdk.installation.symlinkName}" :
+                gradle.liferayWorkspaceEe.ospackageJdkHome
+    )
+
+    //
+    // The description of how the DEB / RPM will install the Liferay bundle
+    //
+
+    liferayBundleType = gradle.liferayWorkspaceEe.bundleType
+
+    // The directory where the TAR will be temporarily uploaded to be installed from the DEB / RPM
+    liferayBundleSourceArchiveParentDir = '/opt/liferay'
+
+    // The full path to the TAR as uploaded from the DEB / RPM
+    liferayBundleArchive = "${liferayBundleSourceArchiveParentDir}/${project.liferayBundleBuiltTarFile.name}"
+
+    // The absolute path where Liferay bundle will be installed and expected to
+    // be found when uninstalling.
+    liferayHome = "/opt/liferay/liferay-portal-${gradle.liferayWorkspaceEe.bundleType}"
+//    liferayHome = '/opt/liferay/liferay-portal-tomcat'
+
+    // The directory inside 'liferayHome' which hold various data generated by Liferay.
+    liferayHomeDataDirName = 'data'
+
+    // The OS user & group to be used to own all Liferay files and start the bundle
+    liferayUser = 'liferay'
+    liferayGroup = 'liferay'
+
+    // The name of OS service to start / stop liferay. Typically also the name
+    // of script in '/etc/init.d'
+    liferayServiceName = gradle.liferayWorkspaceEe.ospackageLiferayServiceName
+
+    // tar - to extract the packaged Liferay bundle (see 'install-liferay-bundle.sh')
+    requiredPackages = [ 'tar' ] + gradle.liferayWorkspaceEe.ospackageExtraRequiredPackages
+}
+
+assert currentEnvironmentName, "'currentEnvironmentName' retrieved from 'gradle.liferayWorkspace' cannot be empty"
+
+assert liferayBundleBuiltTarFile, "Task '${distBundleTarTask}' does not produce any .tag.gz file"
+
+apply from: 'templates.gradle'
+
+// The package definition common to both DEB and RPM packages. Contains the files being
+// installed into / removed from OS when package is added / removed by the package manager
+// in the OS (dpkg for DEB, rpm for RPM).
+ospackage {
+    def sanitizer = new Sanitizer(logger: logger)
+
+    packageName = sanitizer.sanitizePackageName("${rootProject.name}.${currentEnvironmentName}")
+
+    packageDescription = "Liferay bundle (${liferayBundleType}) installed in '${liferayHome}', " +
+            "service script '/etc/init.d/${liferayServiceName}'"
+
+    // take checked project's version (no 'undefined') and append the environment name which was used
+    version = sanitizer.sanitizePackageVersion(gradle.liferayWorkspaceEe.projectVersion)
+
+    // releaseNumber is type int, already checked in 'liferay-workspace-ee.gradle'
+    release = gradle.liferayWorkspaceEe.releaseNumber
+
+    // default owner of all files installed by the packages; we will chown
+    // to liferay:liferay selectively, in packaged installation scripts
+    user 'root'
+    permissionGroup 'root'
+
+
+    // add TAR-ed bundle, will be installed using script ('install-liferay-bundle.sh')
+    // from target location '${liferayBundleArchive}'
+    from(liferayBundleBuiltTarFile) {
+        into liferayBundleSourceArchiveParentDir
+    }
+
+    // add startup script;
+    // in SCM, keep it as liferay-tomcat.sh to allow IDE formatting and rename
+    // it during transfer to DEB / RPM
+    from(generatePkgFilesFromTemplates.getOutputFile("init.d/liferay-${liferayBundleType}.sh")) {
+        into '/etc/init.d'
+        rename "liferay-${liferayBundleType}.sh", liferayServiceName
+
+        fileMode 0744
+    }
+
+    // TODO in order to do the SIZE, we also need to make sure cron runs logrotate
+    // more often, like hourly (by default only runs it daily)
+    //
+    // TODO it would even be best to not log that much into catalina.out at all, e.g.
+    // raise the level for console to WARN? Luckyly, Tomcat appends to console.out ( 1>>... 2>&1),
+    // unlike Solr, which does redirect ( 1>... 2>&1 ), see https://issues.apache.org/jira/browse/SOLR-8232
+    // so logrotate should be able to rotate it without the leading-zero issue
+
+    // TODO use logrorate at all? Based on: https://jdebp.eu/FGA/do-not-use-logrotate.html
+
+    from(generatePkgFilesFromTemplates.getOutputFile("logrotate.d/liferay-${liferayBundleType}")) {
+        into '/etc/logrotate.d'
+        rename "liferay-${liferayBundleType}.sh", liferayServiceName
+
+        fileMode 0644
+    }
+
+    requiredPackages.each {
+        requires(it)
+    }
+}
+
+
+task downloadOracleJdk(type: Download) {
+    description "Downloads configured Oracle JDK (${jdk.download.archiveName}) into ${jdksCacheDir}."
+
+    group "Liferay Workspace EE - OS package"
+
+    src jdk.download.url
+    dest jdksCacheDir
+
+    // do not try to fetch the file again, if it already exists locally; prevents HTTP
+    // request to given URL, which would always require files.liferay.com credentials
+    overwrite false
+
+    onlyIfNewer true
+
+    acceptAnyCertificate true
+    header 'Cookie', 'oraclelicense=accept-securebackup-cookie'
+
+    username findProperty('downloadOracleJdkUserName')
+    password findProperty('downloadOracleJdkPassword')
+
+    finalizedBy 'verifyOracleJdk'
+    finalizedBy 'downloadOracleJdkNote'
+
+    ext.getArchivePath = {
+        return file("${jdksCacheDir}/${jdk.download.archiveName}")
+    }
+
+    doFirst {
+        jdksCacheDir.mkdirs()
+    }
+}
+
+task verifyOracleJdk(type: Verify, dependsOn: downloadOracleJdk) {
+    description "Verifies that the downloaded Oracle JDK (${downloadOracleJdk.getArchivePath()}) " +
+            "is valid based on its checksum."
+
+    group "Liferay Workspace EE - OS package"
+
+    src downloadOracleJdk.getArchivePath()
+
+    if (jdk.download.sha256Checksum) {
+        algorithm 'SHA-256'
+        checksum jdk.download.sha256Checksum
+    } else {
+        algorithm 'MD5'
+        checksum jdk.download.md5Checksum
+    }
+}
+
+task downloadOracleJdkNote() {
+    onlyIf {
+        downloadOracleJdk.state.failure != null
+    }
+
+    doLast {
+        // Make sure to give a hint to user if 'downloadOracleJdk' fails. This task
+        // is finalizing 'downloadOracleJdk', so it will run even on the failure
+        // of 'downloadOracleJdk'
+
+        println """\
+                    |
+                    |NOTE: Make sure to provide valid 'oracle.com' credentials to Gradle 
+                    |  as project properties, if necessary:
+                    |    * 'downloadOracleJdkUserName'
+                    |    * 'downloadOracleJdkPassword'
+                    |  using e.g. init script file (see init.workspace-ee-sample.gradle). In some cases,
+                    |  the needed JDK might not be downloadable due to restrictions for public downloads 
+                    |  on oracle.com - only the latest JDK update (within major version) can be 
+                    |  downloaded without credentials. Credentials used for this build: 
+                    |  ${downloadOracleJdkUserName} / ${downloadOracleJdkPassword ? '***' : ''}
+                    |
+                    |  You can also customize the JDK version used by the workspace in 
+                    |  'gradle/liferay-workspace-ee/ospackage/ospackage.gradle' to be the latest 
+                    |  one or upgrade to the latest liferay-workspace-ee which should use the latest one.
+                    |
+                    |  You can also download the JDK manually: 
+                    |     ${jdk.download.url} 
+                    |  and place it into your local cache:
+                    |     ${jdksCacheDir.absolutePath}                         
+                    |  to make it available to this workspace build.
+                    |""".stripMargin()
+    }
+}
+
+/**
+ * Adds all packaging scripts common to both DEB and RPM tasks, on the task instance
+ * being passed as the argument.
+ *
+ * @param debOrRpmTask the instance of Deb or Rpm task (or their subclass)
+ */
+def applyCommonDebRpmTaskConfiguration =  {
+
+    dependsOn project.checkBundleType, project.generatePkgFilesFromTemplates
+
+    destinationDir project.rootProject.buildDir
+
+    if (gradle.liferayWorkspaceEe.ospackageJdkInstallationType == JdkInstallationType.ORACLE_JDK_BUNDLED.key) {
+        dependsOn downloadOracleJdk
+
+        // bundle the Oracle JDK and extract it where the install-oracle-jdk-x-linux-x64.sh expects it
+        from(downloadOracleJdk.getArchivePath()) {
+            into jdk.installation.sourceArchiveParentDir
+        }
+    }
+
+    // packaged install / uninstall scripts
+    preInstall generatePkgFilesFromTemplates.getOutputFile('pkg_scripts/add-liferay-user-and-group.sh')
+
+    gradle.liferayWorkspaceEe.ospackageExtraPreInstall.each {
+        preInstall rootProject.file(it)
+    }
+
+    if (gradle.liferayWorkspaceEe.ospackageJdkInstallationType
+            in [ JdkInstallationType.ORACLE_JDK_BUNDLED.key, JdkInstallationType.ORACLE_JDK_DOWNLOADED_ON_INSTALL.key ]) {
+        // Add the step to install the Oracle JDK (possibly downloading it first, if not bundled)
+        postInstall generatePkgFilesFromTemplates.getOutputFile(
+                "/pkg_scripts/install-oracle-jdk-${jdk.versionMajor}-linux-x64.sh")
+    }
+    
+
+    // Make sure Liferay is stopped before installing the new bundle;
+    // file will be present, since it gets installed by the DEB / RPM
+    postInstall generatePkgFilesFromTemplates.getOutputFile('pkg_scripts/stop-liferay-bundle.sh')
+
+    // Run the Liferay bundle installation script
+    postInstall generatePkgFilesFromTemplates.getOutputFile('pkg_scripts/install-liferay-bundle.sh')
+
+    // add the '/etc/init.d/liferay-tomcat' script to start Liferay bundle Tomcat on OS boot
+    postInstall generatePkgFilesFromTemplates.getOutputFile('pkg_scripts/enable-liferay-bundle-service.sh')
+
+    // Do NOT start the Liferay Tomcat after installation of this DEB / RPM; only inform
+    // it's up to the user to perform this task
+    postInstall "echo '=============================='"
+    postInstall "echo ' Liferay Installation Summary'"
+    postInstall "echo '=============================='"
+    postInstall "echo '==> Installed Liferay bundle can be started with " +
+            "[/etc/init.d/${liferayServiceName} start] - as root or sudo <=='"
+    postInstall "echo ''"
+
+
+    // After installation, remove the installed bundle archive, since it is not
+    // needed any more (all bundle files get extracted using the script)
+    postInstall "rm -rf '${liferayBundleArchive}'"
+
+    if (gradle.liferayWorkspaceEe.ospackageJdkInstallationType in
+            [ JdkInstallationType.ORACLE_JDK_BUNDLED.key, JdkInstallationType.ORACLE_JDK_DOWNLOADED_ON_INSTALL.key ]) {
+        postInstall "rm -rf '${jdk.installation.sourceArchiveParentDir}/${jdk.download.archiveName}'"
+    }
+
+    gradle.liferayWorkspaceEe.ospackageExtraPostInstall.each {
+        postInstall rootProject.file(it)
+    }
+
+    preUninstall generatePkgFilesFromTemplates.getOutputFile('pkg_scripts/stop-liferay-bundle.sh')
+
+    gradle.liferayWorkspaceEe.ospackageExtraPreUninstall.each {
+        preUninstall rootProject.file(it)
+    }
+    
+
+    // Delete the Liferay bundle directory, but leave [bundle]/data untouched
+    preUninstall generatePkgFilesFromTemplates.getOutputFile('pkg_scripts/uninstall-liferay-bundle.sh')
+
+    // Remove the upstart links to /etc/init.d script; do this in pre- phase, before
+    // removing the /etc/init.d script file itself
+    preUninstall generatePkgFilesFromTemplates.getOutputFile('pkg_scripts/disable-liferay-bundle-service.sh')
+
+    // keep the installed Oracle JDK (extracted files inside directory /opt/liferay/oracle-jdk-8)
+    // in place after DEB / RPM removal - no need to delete them since we do not set any global variable
+    // pointing to this JDK (its for Liferay only, used by specifying full path of the 'java' binary)
+
+    gradle.liferayWorkspaceEe.ospackageExtraPostUninstall.each {
+        postUninstall rootProject.file(it)
+    }
+
+    doLast {
+        String jdkNote
+        switch (gradle.liferayWorkspaceEe.ospackageJdkInstallationType) {
+            case JdkInstallationType.ORACLE_JDK_BUNDLED.key:
+                jdkNote = "Oracle JDK ${project.jdk.version} - bundled"
+                break
+            case JdkInstallationType.ORACLE_JDK_DOWNLOADED_ON_INSTALL.key:
+                jdkNote = "Oracle JDK ${project.jdk.version} - will be downlaoded on installation"
+                break
+            case JdkInstallationType.UNMANAGED.key:
+                jdkNote = "JDK not managed automatically - expected to be found in ${javaHome ?: "PATH (JDK home set as empty in 'liferay.workspace.ee.ospackage.jdk.home')"}, "
+                break
+        }
+
+        def archiveSizeMB = ((double) project.rootProject.file(getArchivePath()).size() / (1000 * 1000))
+
+        def archiveSize =
+                (archiveSizeMB < 1000) ?
+                        "${archiveSizeMB.round(2)} MB" :
+                        "${(archiveSizeMB / 1000).round(2)} GB"
+
+        println "Assembled Liferay bundle as ospackage archive " +
+                "'${project.rootProject.relativePath(getArchivePath())}' (${archiveSize}):"
+        println "  * package name '${packageName}', version '${version}', release ${release}"
+        println "  * requires packages: ${requiredPackages.join(', ')}"
+        println "  * ${jdkNote}"
+
+        // show summary of
+        [
+                'before installation': gradle.liferayWorkspaceEe.ospackageExtraPreInstall,
+                'after installation':  gradle.liferayWorkspaceEe.ospackageExtraPostInstall,
+                'before removal':      gradle.liferayWorkspaceEe.ospackageExtraPreUninstall,
+                'after removal':       gradle.liferayWorkspaceEe.ospackageExtraPostUninstall
+        ].findAll { k, scripts -> scripts }.each { String phase, List scripts ->
+            println "  * extra scripts to run ${phase} of Liferay files: "
+            scripts.each { script ->
+            println "      * ${script}"
+            }
+        }
+    }
+}
+
+// DEB on Debian-based systems:
+//  * install using 'sudo dpkg -i YOUR_DEB_FILE.deb'
+//  * remove using 'sudo dpkg -r YOUR_PACKAGE_NAME'.
+//
+// See:
+//  * http://www.cyberciti.biz/howto/question/linux/dpkg-cheat-sheet.php
+//  * https://www.debian.org/doc/manuals/debian-faq/ch-pkg_basics.en.html
+//
+task distBundleDeb(type: Deb) {
+
+    group "Liferay Workspace EE - OS package"
+
+    // set description once all info for 'getArchivePath()' was configured (packageName, version, release)
+    description "Assembles the Liferay bundle as DEB package into '${rootProject.relativePath(getArchivePath())}'. "
+
+    // we are installing OracleJDK 'linux-x64', so enforce 64b architecture
+    arch = 'amd64'
+
+    // based on: https://stackoverflow.com/a/14566995
+    configure applyCommonDebRpmTaskConfiguration
+}
+
+// RPM on Redhat-based systems:
+//  * install with 'sudo rpm -ivh --replacefiles --replacepkgs YOUR_RPM_FILE.rpm'
+//  * remove with 'sudo rpm -e YOUR_PACKAGE_NAME'.
+//
+// See:
+//  * http://www.rpm.org/max-rpm/ch-rpm-install.html
+//  * http://www.rpm.org/max-rpm/s1-rpm-install-additional-options.html
+task distBundleRpm(type: Rpm) {
+
+    group "Liferay Workspace EE - OS package"
+
+    // set description once all info for 'getArchivePath()' was configured (packageName, version, release)
+    description "Assembles the Liferay bundle as RPM into '${rootProject.relativePath(getArchivePath())}'. "
+
+    
+    // we are installing OracleJDK 'linux-x64', so enforce 64b architecture
+
+    // see:
+    //  * http://grepcode.com/file/repo1.maven.org/maven2/org.redline-rpm/redline/1.1.16/org/redline_rpm/header/Architecture.java
+    //  * http://grepcode.com/file/repo1.maven.org/maven2/org.redline-rpm/redline/1.1.16/org/redline_rpm/header/Os.java
+    arch = Architecture.X86_64
+    os   = Os.LINUX
+
+    // based on: https://stackoverflow.com/a/14566995
+    configure applyCommonDebRpmTaskConfiguration
+}
+
+clean {
+    // we are building DEB / RPM into root project's build/, so make sure to delete it
+    delete distBundleDeb.outputs.files, distBundleRpm.outputs.files
+}
+
+/**
+ * Allows to transform any String into being a valid DEB / RPM package name, as
+ * required by 'ospackage' plugin, which builds DEBs / RPMs for us.
+ */
+@groovy.transform.Immutable
+class Sanitizer {
+
+    private final Logger logger
+
+    // https://github.com/craigwblake/redline/blob/master/src/main/java/org/redline_rpm/Builder.java#L61-L62
+    def private static final nameForbiddenFirstCharacterPattern = ~'^[^a-z0-9]+'
+    def private static final nameForbiddenCharactersPattern = ~'[^a-z0-9.+-]+'
+
+    def private static final versionForbiddenCharactersPattern = ~'[^a-z0-9.]+'
+
+    /**
+     * DEB / RPM package name has to match [a-z0-9.+-] and start with alphanumeric character, example error is:
+     *      Invalid package name 'liferay-workspace-DistBundleDebSpec-1455895234095' - a valid package name must
+     *      start with an alphanumeric character, have a length of at least two characters and only contain [a-z0-9.+-]
+     *
+     * @param unsanitizedPackageName the starting name to transform into valid DEB / RPM package name
+     * @return
+     */
+    def String sanitizePackageName(String unsanitizedPackageName) {
+        
+        logger.info "[LWE] unsanitized package name: '${unsanitizedPackageName}'"
+
+        String sanitizedPackageName = (unsanitizedPackageName ?: '').trim().toLowerCase()
+
+        logger.debug "[LWE] 1: ${sanitizedPackageName}"
+
+        // make sure package name starts with alpha-num character -- strip any other chars until alpha-num one remains
+        sanitizedPackageName = sanitizedPackageName.replaceFirst(nameForbiddenFirstCharacterPattern, '')
+
+        logger.debug "[LWE] 2: ${sanitizedPackageName}"
+
+        // for too short names (like root project's dir like 'a'), make it 2 characters long
+        if (sanitizedPackageName.length() == 0) {
+            sanitizedPackageName = 'aa'
+
+            logger.debug "[LWE] 3: ${sanitizedPackageName}"
+        } else if (sanitizedPackageName.length() == 1) {
+            sanitizedPackageName += '-'
+
+            logger.debug "[LWE] 4: ${sanitizedPackageName}"
+        }
+
+        // make sure all disallowed characters are replaced with '-'
+        sanitizedPackageName = sanitizedPackageName.replaceAll(nameForbiddenCharactersPattern, '-')
+
+        logger.info "[LWE] Sanitized DEB / RPM package name: '${unsanitizedPackageName}' -> '${sanitizedPackageName}'"
+
+        return sanitizedPackageName
+    }
+
+    def String sanitizePackageVersion(String unsanitizedPackageVersion) {
+        
+        logger.info "[LWE] unsanitized package version: '${unsanitizedPackageVersion}'"
+
+        String sanitizedVersionName = (unsanitizedPackageVersion ?: '').trim().toLowerCase()
+
+        logger.debug "[LWE] 1: ${sanitizedVersionName}"
+
+        sanitizedVersionName = sanitizedVersionName.replaceAll(versionForbiddenCharactersPattern, '.')
+
+        logger.debug "[LWE] 2: ${sanitizedVersionName}"
+
+        // trim first sequence of repeated '.'
+        sanitizedVersionName = sanitizedVersionName.replaceAll(~'^[.]+', '')
+
+        logger.debug "[LWE] 3: ${sanitizedVersionName}"
+
+        // replace other sequences of repeated '.' with single one
+        sanitizedVersionName = sanitizedVersionName.replaceAll(~'[.]+', '.')
+
+        logger.debug "[LWE] 4: ${sanitizedVersionName}"
+
+        if (!sanitizedVersionName) {
+            sanitizedVersionName = '1'
+
+            logger.debug "[LWE] 5a: ${sanitizedVersionName}"
+            
+        } else if (!sanitizedVersionName.charAt(0).isDigit()) {
+            // correct DEB versions have to start with a number and the plugin enforces it:
+            //      Invalid upstream version 'gsms.326.deploy.updates' - a valid version must start
+            //      with a digit and only contain [A-Za-z0-9.+:~-]
+            sanitizedVersionName = "1.${sanitizedVersionName}"
+
+            logger.debug "[LWE] 5b: ${sanitizedVersionName}"
+        }
+
+        logger.info "[LWE] Sanitized DEB / RPM package version: '${unsanitizedPackageVersion}' -> '${sanitizedVersionName}'"
+
+        return sanitizedVersionName
+    }
+
+}
+
+task testSanitizerClass {
+
+    doLast {
+
+        // since we Gradle does not support 'buildSrc' inside sub-projects, at least
+        // allow to test the inline-class we created in here
+        // this task has its Spock test inside 'TestSanitizerClassSpec'
+
+        def s = new Sanitizer(logger: logger)
+
+        assert s.sanitizePackageName("a") == "a-"
+        assert s.sanitizePackageName("-a") == "a-"
+        assert s.sanitizePackageName("_") == "aa"
+        assert s.sanitizePackageName("some project 0123456789") == "some-project-0123456789"
+        assert s.sanitizePackageName("some...project+++name---here") == "some...project+++name---here"
+        assert s.sanitizePackageName("some     project") == "some-project"
+        assert s.sanitizePackageName("Some_Project__name") == "some-project-name"
+
+        logger.quiet "All tests for Sanitizer.sanitizePackageName() class passed"
+
+        assert s.sanitizePackageVersion('1.0.0') == '1.0.0'
+        assert s.sanitizePackageVersion('1.0.0.local') == '1.0.0.local'
+        assert s.sanitizePackageVersion('1.0.0.local--2_-_3') == '1.0.0.local.2.3'
+        assert s.sanitizePackageVersion('-.0.0.-local--2_-_3') == '0.0.local.2.3'
+        assert s.sanitizePackageVersion('master') == '1.master'
+        assert s.sanitizePackageVersion(null) == '1'
+        assert s.sanitizePackageVersion('') == '1'
+
+        logger.quiet "All tests for Sanitizer.sanitizePackageVersion() class passed"
+    }
+}
+
+@groovy.transform.TupleConstructor(includes = [ 'key'] )
+enum JdkInstallationType {
+    ORACLE_JDK_BUNDLED('oracle-jdk:bundled'),
+    ORACLE_JDK_DOWNLOADED_ON_INSTALL('oracle-jdk:downloaded-on-install'),
+    UNMANAGED('unmanaged')
+
+    final String key
+}

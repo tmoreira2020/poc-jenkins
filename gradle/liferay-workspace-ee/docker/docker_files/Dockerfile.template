@@ -1,0 +1,19 @@
+# We start from raw image built and tagged by Packer in workspace ee, typically
+# will be something like 'acme/liferay-test-project.local:1.0.0-1' where:
+#   * 'acme' is based on liferay.workspace.ee.docker.repository.company in gradle.properties
+#   * the rest is based on Gradle project name, workspace ee environment, version and releaseNumber
+#
+FROM @DOCKER_FROM@
+
+# Based on 'liferay.workspace.ee.docker.maintainer' in gradle.properties
+MAINTAINER @GRADLE_liferay.workspace.ee.docker.maintainer@
+
+# The user added by the ospackage of Liferay bundle pre-installed into raw image
+USER @DOCKER_LIFERAY_USER@
+
+# The startup script is added by Packer into the raw image
+# Bash must be used instead of sh in order to trap signals
+CMD [ "@BASH_PATH@", "@DOCKER_LIFERAY_STARTUP_SCRIPT@" ]
+
+# Based on 'liferay.workspace.ee.docker.expose' in gradle.properties
+EXPOSE @GRADLE_liferay.workspace.ee.docker.expose@

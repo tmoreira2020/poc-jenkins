@@ -1,0 +1,139 @@
+/*
+ * Copyright (c) 2000-present Liferay, Inc. All rights reserved.
+ *
+ * The contents of this file are subject to the terms of the Liferay Enterprise
+ * Subscription License ("License"). You may not use this file except in
+ * compliance with the License. You can obtain a copy of the License by
+ * contacting Liferay, Inc. See the License for the specific language governing
+ * permissions and limitations under the License, including but not limited to
+ * distribution rights of the Software.
+ */
+
+import de.undercouch.gradle.tasks.download.Download
+
+plugins {
+    // https://github.com/michel-kraemer/gradle-download-task
+    id "de.undercouch.download" version '3.1.2'
+
+    // https://github.com/stevesaliman/gradle-properties-plugin
+    id 'net.saliman.properties' version '1.4.6'
+}
+
+
+// see /liferay-build-tool/gradle/publish-base.gradle in GitHub ironman repo
+def workspaceEeGroup = 'com.liferay.global-services.lwe'
+def workspaceEeArtifactId = 'liferay-workspace-ee-bin'
+def snapshotsRepoName = 'liferay-private-snapshots'
+def releasesRepoName = 'liferay-private-releases'
+
+def latestSnapshotUrl =
+        "https://repository.liferay.com/nexus/service/local/artifact/maven/redirect?r=${snapshotsRepoName}&g=${workspaceEeGroup}&a=${workspaceEeArtifactId}&p=zip&v=LATEST"
+
+def latestReleaseUrl =
+        "https://repository.liferay.com/nexus/service/local/artifact/maven/redirect?r=${releasesRepoName}&g=${workspaceEeGroup}&a=${workspaceEeArtifactId}&p=zip&v=LATEST"
+
+
+// REST API based on:
+//      https://stackoverflow.com/questions/9280447/how-do-i-provide-url-access-to-the-latest-snapshot-of-an-artifact-in-nexus
+
+// sample URLs:
+//      https://repository.liferay.com/nexus/service/local/artifact/maven/redirect?r=liferay-private-snapshots&g=com.liferay.global-services.lwe&a=liferay-workspace-ee-bin&p=zip&v=LATEST
+//      https://repository.liferay.com/nexus/service/local/artifact/maven/redirect?r=liferay-private-releases&g=com.liferay.global-services.lwe&a=liferay-workspace-ee-bin&p=zip&v=LATEST
+
+[
+        ['snapshot', 'ee', latestSnapshotUrl ],
+        ['snapshot', 'ms', latestSnapshotUrl ],
+        ['release',  'ee', latestReleaseUrl  ],
+        ['release',  'ms', latestReleaseUrl  ]
+].each { upgradeVariant ->
+
+    String artifactType  = upgradeVariant[0]    // snapshot / release
+    String workspaceType = upgradeVariant[1]    // ee / ms
+    String artifactUrl   = upgradeVariant[2]
+
+    def downloadTaskName = "downloadLatestWorkspaceEe${artifactType.capitalize()}"
+
+    def workDir = "${rootProject.buildDir}/workspace-ee-upgrade"
+
+    if (!tasks.findByName(downloadTaskName)) {
+        task "${downloadTaskName}"(type: Download) {
+            group "Liferay Workspace EE - Upgrade Workspace"
+            description "Downloads the latest '${artifactType}' intaller of liferay-workspace-ee"
+
+            def destDir = file("${workDir}/downloaded")
+
+            ext.archivePath = file("${destDir}/${workspaceEeArtifactId}-latest.zip")
+
+
+            src artifactUrl
+            dest archivePath
+
+            username findProperty('liferayRepositoryUserName')
+            password findProperty('liferayRepositoryPassword')
+
+            requiredProperties 'liferayRepositoryUserName', 'liferayRepositoryPassword'
+
+            doFirst {
+                destDir.deleteDir()
+                destDir.mkdirs()
+            }
+        }
+    }
+
+    task "upgradeWorkspaceEeToLatest${artifactType.capitalize()}${workspaceType.capitalize()}"(type: Copy) {
+        group "Liferay Workspace EE - Upgrade Workspace"
+        description "Extracts the latest '${artifactType}' intaller of liferay-workspace-ee"
+
+        dependsOn downloadTaskName
+
+        def zipFile = tasks.findByName(downloadTaskName).archivePath
+        def outputDir = file("${workDir}/extracted")
+
+        from zipTree(zipFile)
+        into outputDir
+
+        doFirst {
+            outputDir.deleteDir()
+            outputDir.mkdirs()
+        }
+
+        doLast {
+            def windowsOS = System.getProperty("os.name")?.toLowerCase()?.contains("windows")
+
+            // there will be just the extracted dir inside, like 'liferay-workspace-ee-bin-1.1.18'
+            def installerDir = "${outputDir}/${outputDir.list().first()}"
+
+            def commandLineArray = windowsOS ?
+                    [ 'cmd', '/c', "bin/cli.bat" ] :
+                    [ "bin/cli" ]
+
+            commandLineArray.addAll([
+                    (workspaceType == 'ms') ? 'upgrade-ms' : 'upgrade',
+                    rootProject.projectDir
+            ])
+
+            exec {
+                workingDir installerDir
+
+                executable commandLineArray.head()
+
+                args commandLineArray.tail()
+            }
+        }
+    }
+}
+
+// shortcuts
+task upgradeWorkspaceEe() {
+    group upgradeWorkspaceEeToLatestReleaseEe.group
+    description upgradeWorkspaceEeToLatestReleaseEe.description
+
+    dependsOn upgradeWorkspaceEeToLatestReleaseEe
+}
+
+task upgradeWorkspaceMs() {
+    group upgradeWorkspaceEeToLatestReleaseMs.group
+    description upgradeWorkspaceEeToLatestReleaseMs.description
+
+    dependsOn upgradeWorkspaceEeToLatestReleaseMs
+}

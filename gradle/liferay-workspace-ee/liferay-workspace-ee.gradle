@@ -1,0 +1,977 @@
+/*
+ * Copyright (c) 2000-present Liferay, Inc. All rights reserved.
+ *
+ * The contents of this file are subject to the terms of the Liferay Enterprise
+ * Subscription License ("License"). You may not use this file except in
+ * compliance with the License. You can obtain a copy of the License by
+ * contacting Liferay, Inc. See the License for the specific language governing
+ * permissions and limitations under the License, including but not limited to
+ * distribution rights of the Software.
+ */
+
+// This script sets default values of Liferay Workspace EE properties, based on '[root]/gradle-ee-default.properties'
+//
+// This script should be the parent project of all other EE projects, see 'settings-ee.gradle'
+//
+
+buildscript {
+    // https://github.com/ajoberstar/grgit
+    repositories {
+        jcenter()
+    }
+
+    dependencies {
+        // https://github.com/ajoberstar/grgit
+        classpath 'org.ajoberstar:grgit:1.7.1'
+    }
+}
+
+// check only supported ee / ms properties were used, load defaults for the ones not used
+[
+        'ee': rootProject.file("gradle.workspace-ee-defaults.properties"),
+        'ms': rootProject.file("gradle.workspace-ms-defaults.properties")
+].each { String type, File defaultsFile ->
+    if (defaultsFile.exists()) {
+        checkOnlySupportedPropertiesUsed(type, defaultsFile)
+
+        loadPropertiesDefaults(type, defaultsFile)
+    }
+}
+
+
+// Create global extension for EE features, listing all properties being used by the EE scrips;
+// project-wide properties, typically same for all the project users, are listed in 'gradle.workspace-ee-defaults.properties'
+// which is also loaded above
+gradle.ext.liferayWorkspaceEe = [
+
+        // The tasks added by Workspace Plugin which we depend on
+        // Based on:
+        // https://github.com/liferay/liferay-portal/blob/master/modules/sdk/gradle-plugins-workspace/src/main/java/com/liferay/gradle/plugins/workspace/internal/configurators/RootProjectConfigurator.java
+
+        workspaceTasks: [
+                initBundle    : findAndCheckWorkspaceTaskByPath(':initBundle'),
+                distBundleZip : findAndCheckWorkspaceTaskByPath(':distBundleZip'),
+                distBundleTar : findAndCheckWorkspaceTaskByPath(':distBundleTar'),
+                distBundle    : findAndCheckWorkspaceTaskByPath(':distBundle'),
+                downloadBundle: findAndCheckWorkspaceTaskByPath(':downloadBundle')
+        ],
+
+        // 'version' of any Gradle project defaults to String 'unspecified' when
+        // not set in any '*.gradle' file, so provide a better default.
+        //
+        // 'project.version' should be set in root project's 'build.gradle' file.
+        projectVersion: (
+                determineProjectVersion(
+                        findProperty('liferay.workspace.ee.project.version.source')
+                ) ?: '0.0.0'
+        ) as String,
+
+        // The incremental build number, used to to build DEB / RPM packages and AMIs to distinguish
+        // artifacts when same version but newer build is being produced.
+        // This will typically be passed to Gradle as '-PreleaseNumber=$BUILD_NUMBER' in Jenkins build.
+
+        // TODO change to 'buildNumber'? This would mean we need to support both, think of project ami cleanup, Jenkins jobs
+        // TODO ideally change to 'liferay.workspace.ee.build.number'
+        releaseNumber: (
+                'releaseNumber'.with { propName ->
+                    findAndCheckProperty(
+                            propName,
+                            {
+                                assertUserData "${it}".isInteger(), "'${propName}' has to be an integer"
+                            }
+                    ) ?: '1'
+                }
+        ).toInteger() as int,
+
+        // The command-line tools which Gradle needs to use to build the EE artifacts.
+
+        externalExecutables: [
+                packer: [
+                        // test Packer with 'packer version', which returns 0 as expected. 'packer -version' returns 1
+                        name               : 'packer',
+                        executable         : (findProperty('packerExecutable') ?: 'packer') as String,
+                        validationArguments: [ 'version' ],
+                        downloadUrl        : 'https://www.packer.io',
+                        configPropertyName : 'packerExecutable'
+                ],
+                docker: [
+                        name               : 'docker',
+                        executable         : (findProperty('dockerExecutable') ?: 'docker') as String,
+                        validationArguments: [ 'version' ],
+                        downloadUrl        : 'https://www.docker.com',
+                        configPropertyName : 'dockerExecutable'
+                ]
+        ],
+
+        environments: (
+                use (StringCategory) {
+                    def propName = 'liferay.workspace.ee.environments'
+
+                    findAndCheckProperty(
+                            propName,
+                            {
+                                List<String> values = it.toListFromCommaSeparatedString()
+
+                                assertUserData !values.find { it == 'common' },
+                                        "'common is not really an environment, do not use it in ${propName}'"
+
+                                def envsInConfigsDir =
+                                        rootProject.file('configs')
+                                                .listFiles()
+                                                .findAll { it.isDirectory() }
+                                                .collect { it.name }
+
+                                def missingEnvs = values.findAll { !(it in envsInConfigsDir) }
+
+                                assertUserData missingEnvs.isEmpty(),
+                                        "There are some values in '${propName}' which do not exist " +
+                                                "in configs/ directory (typo?): ${missingEnvs}"
+                            }
+                    )?.toListFromCommaSeparatedString() ?: []
+                }
+        ) as List,
+
+        projectVersionSource: (
+                'liferay.workspace.ee.project.version.source'.with { propName ->
+                    findAndCheckProperty(
+                            propName,
+                            {
+                                def validKeys = ProjectVersionSource.values().collect { it.key }
+
+                                assertUserData it in validKeys,
+                                        "'${propName}' has to be one of ${validKeys}"
+                            }
+                    )
+                }
+        ) as String,
+
+        javaVersionMajor: (
+                'liferay.workspace.ee.java.version.major'.with { propName ->
+                    findAndCheckProperty(
+                            propName,
+                            {
+                                def allowedValues = [ '7', '8' ]
+                                assertUserData it in allowedValues,
+                                        "Value '${it}' is not allowed for '${propName}', please use only one of: " +
+                                                "${allowedValues.join(', ')}"
+
+                                assertUserData JavaVersion.current().majorVersion == it,
+                                        "Java ${it} is set to be used (${propName}) but ${JavaVersion.current()} found. " +
+                                                "Please change your JAVA_HOME environment variable / java command in PATH to point " +
+                                                "to JDK ${it}. " +
+                                                "Liferay 7.0 is JDK8 only, so you should use this version to compile all the sources. " +
+                                                "Liferay 6.2 is JDK7 only."
+                            }
+                    ) ?: ''
+                }
+        ) as int,
+
+        // The type of bundle, typically the name of app server being used, which was
+        // provided to the liferay-workspace, using 'liferay.workspace.bundle.url'.
+
+        bundleType                  : (
+                findProperty('liferay.workspace.ee.bundle.type') ?: ''
+        ) as String,
+
+        bundleAppServerDirectoryName: (
+                'liferay.workspace.ee.bundle.app.server.directory.name'.with { propName ->
+                    findAndCheckProperty(
+                            propName,
+                            {
+                                assertUserData !new File(it).isAbsolute(), "The path in '${propName}' has to be relative"
+                            }
+                    ) ?: ''
+                }
+        ) as String,
+
+        //
+        // Properties for 'base' module
+        //
+
+        bundleSha256Checksum: (
+                'liferay.workspace.ee.bundle.sha256.checksum'.with { propName ->
+                    findAndCheckProperty(
+                            propName,
+                            {
+                                assertUserData !it || it.length() == 64,
+                                        "Your '${propName}' does not look like a SHA-256 sum, " +
+                                                "64 hexadecimal characters were expected, but you provided ${it.length()}"
+                            }
+                    )
+                }
+        ) as String,
+
+        bundleExcludeFiles: (
+                use (StringCategory) {
+                    def propName = 'liferay.workspace.ee.bundle.exclude.files'
+
+                    findAndCheckProperty(
+                            propName,
+                            {
+                                def values = it.toListFromCommaSeparatedString()
+
+                                def pathsToExcludeWhichAreAbsolute = values.findAll { new File(it).isAbsolute() }
+
+                                assertUserData pathsToExcludeWhichAreAbsolute.isEmpty(),
+                                        "Paths in '${propName}' have to be relative, but these are not:" +
+                                                "\n  * ${pathsToExcludeWhichAreAbsolute.join('\n  * ')}"
+                            }
+                    )?.toListFromCommaSeparatedString() ?: []
+                }
+        ) as List,
+
+        bundleHardenOnStart: (
+                'liferay.workspace.ee.bundle.harden.on.start'.with { propName ->
+                    findAndCheckProperty(
+                            propName,
+                            {
+                                assertUserData it in [ 'true', 'false' ],
+                                        "For '${propName}', please provide a boolean value - either 'true' or 'false'"
+                            }
+                    ) ?: false
+                }
+        ).toBoolean() as boolean,
+
+        persistsNpmNodeModulesCache: (
+                'liferay.workspace.ee.persist.npm.node.modules.cache'.with { propName ->
+                    findAndCheckProperty(
+                            propName,
+                            {
+                                assertUserData it in [ 'true', 'false' ],
+                                        "For '${propName}', please provide a boolean value - either 'true' or 'false'"
+                            }
+                    ) ?: false
+                }
+        ).toBoolean() as boolean,
+
+
+        //
+        // Properties for 'ospackage' module
+        //
+
+        ospackageLiferayServiceName:(
+                'liferay.workspace.ee.ospackage.liferay.service.name'.with { propName ->
+                    findAndCheckProperty(
+                            propName,
+                            {
+                                assertUserData it,
+                                        "The '${propName}' cannot be empty"
+
+                                assertUserData it.matches(~/[a-z-]{2,16}/),
+                                        "Please name the service as 2-16 lowercase letters or '-'"
+                            }
+                    )
+                }
+        ) as String,
+
+        ospackageJdkInstallationType: (
+                'liferay.workspace.ee.ospackage.jdk.installation.type'.with { propName ->
+                    findAndCheckProperty(
+                            propName,
+                            {
+                                // matches keys in ospackage.gradle -> JdkInstallationType
+                                def allowedValues = [ 'oracle-jdk:bundled', 'oracle-jdk:downloaded-on-install', 'unmanaged' ]
+
+                                assertUserData it in allowedValues,
+                                        "Value '${it}' is not allowed for '${propName}', please use only one of: " +
+                                                "${allowedValues.join(', ')}"
+                            }
+                    ) ?: ''
+                }
+        ) as String,
+
+        ospackageJdkHome: (
+                'liferay.workspace.ee.ospackage.jdk.home'.with { propName ->
+                    findAndCheckProperty(
+                            propName,
+                            {
+                                def notSetValue = '_not_set_'
+                                def typePropName = 'liferay.workspace.ee.ospackage.jdk.installation.type'
+                                def installationType = findProperty(typePropName)
+
+                                assertUserData installationType != 'unmanaged' || it != notSetValue,
+                                        "When using ${typePropName}=unmanaged, please set ${propName}. " +
+                                                "Set it to empty if JDK will be in PATH."
+                            }
+                    ) ?: ''
+                }
+        ) as String,
+
+        // the liferay.workspace.ee.ospackage.oracle.jdk.* properties are not converted or validated; used directly in ospackage.gradle
+
+        ospackageExtraPreInstall: (
+                use (StringCategory) {
+                    'liferay.workspace.ee.ospackage.extra.pre.install'.with { propName ->
+                        findAndCheckProperty(
+                                propName,
+                                {
+                                    assertListOfRelativeExistingFiles(it, propName)
+                                }
+                        )?.toListFromCommaSeparatedString() ?: []
+                    }
+                }
+        ) as List,
+
+        ospackageExtraPostInstall: (
+                use (StringCategory) {
+                    'liferay.workspace.ee.ospackage.extra.post.install'.with { propName ->
+                        findAndCheckProperty(
+                                propName,
+                                {
+                                    assertListOfRelativeExistingFiles(it, propName)
+                                }
+                        )?.toListFromCommaSeparatedString() ?: []
+                    }
+                }
+        ) as List,
+
+        ospackageExtraPreUninstall: (
+                use (StringCategory) {
+                    'liferay.workspace.ee.ospackage.extra.pre.uninstall'.with { propName ->
+                        findAndCheckProperty(
+                                propName,
+                                {
+                                    assertListOfRelativeExistingFiles(it, propName)
+                                }
+                        )?.toListFromCommaSeparatedString() ?: []
+                    }
+                }
+        ) as List,
+
+        ospackageExtraPostUninstall: (
+                use (StringCategory) {
+                    'liferay.workspace.ee.ospackage.extra.post.uninstall'.with { propName ->
+                        findAndCheckProperty(
+                                propName,
+                                {
+                                    assertListOfRelativeExistingFiles(it, propName)
+                                }
+                        )?.toListFromCommaSeparatedString() ?: []
+                    }
+                }
+        ) as List,
+
+        ospackageExtraRequiredPackages:
+                (
+                        use (StringCategory) {
+                            findProperty(
+                                    'liferay.workspace.ee.ospackage.extra.required.packages'
+                            )?.toListFromCommaSeparatedString() ?: []
+                        }
+                ) as List,
+
+        //
+        // Properties for 'patches' module
+        //
+
+        patchesPatchingToolDownloadBaseUrl: (
+                'liferay.workspace.ee.patches.patching.tool.download.base.url'.with { propName ->
+                    findAndCheckProperty(
+                            propName,
+                            {
+                                assertUserData it && it.startsWith('https://files.liferay.com'),
+                                    "Please download the patching tool only from 'files.liferay.com' and using " +
+                                            "secure protocol (https://) ('${propName}')"
+
+                                assertUserData !it.endsWith('/'),
+                                    "Please provide the URL without trailing '/' ('${propName}')"
+                            }
+                    ) ?: ''
+                }
+        ) as String,
+
+        patchesPatchingToolInstalled: (
+                'liferay.workspace.ee.patches.patching.tool.installed'.with { propName ->
+                    findAndCheckProperty(
+                            propName,
+                            {
+                                assertUserData !it || it.endsWith('.zip'),
+                                        "The name of the installed patching tool has to be a .zip file ('${propName}')."
+                            }
+                    ) ?: ''
+                }
+        ) as String,
+
+        patchesDownloadBaseUrl: (
+                'liferay.workspace.ee.patches.download.base.url'.with { propName ->
+                    findAndCheckProperty(
+                            propName,
+                            {
+                                assertUserData it && it.startsWith('https://files.liferay.com'),
+                                    "Please download the patches only from 'files.liferay.com' and using " +
+                                            "secure protocol (https://) ('${propName}')"
+
+                                assertUserData !it.endsWith('/'),
+                                        "Please provide the URL without trailing '/' ('${propName}')"
+                            }
+                    ) ?: ''
+                }
+        ) as String,
+
+        patchesDownloadAndInstallPatches: (
+                use (StringCategory) {
+                    findProperty(
+                            'liferay.workspace.ee.patches.download.and.install.patches'
+                    )?.toListFromCommaSeparatedString() ?: []
+                }
+        ) as List,
+
+        patchesDir: (
+                'liferay.workspace.ee.patches.dir'.with { propName ->
+                    findAndCheckProperty(
+                            propName,
+                            {
+                                assertUserData !new File(it).isAbsolute(),
+                                        "'${propName}' cannot be an absolute path, please use a relative one"
+                            }
+                    ) ?: ''
+                }
+        ) as String,
+
+
+        //
+        // Properties for 'jenkins' module
+        //
+
+        // Following Jenkins credentials should be set only using Gradle init script
+
+        // default to '', that way Jenkins plugin will not fail before running any task and we can do our own validation
+        jenkinsUserName: (findProperty('jenkinsUserName') ?: '') as String,
+        jenkinsPassword: (findProperty('jenkinsPassword') ?: '') as String,
+
+        // Following Jenkins properties are project-wide and should be set using 'gradle.properties'
+
+        jenkinsServerUrl: (
+                'liferay.workspace.ee.jenkins.server.url'.with { propName ->
+                    findAndCheckProperty(
+                            propName,
+                            { assertUserData it.startsWith('http://') || it.startsWith('https://'),
+                                    "'${propName}' has to contain a valid HTTP(S) protocol" }
+                    ) ?: ''
+                }
+        ) as String,
+
+        // make sure to convert the boolean property when set: https://issues.gradle.org/browse/GRADLE-2306
+        jenkinsServerSecure: (
+                'liferay.workspace.ee.jenkins.server.secure'.with { propName ->
+                    findAndCheckProperty(
+                            propName,
+                            {
+                                assertUserData it in [ 'false', 'true' ],
+                                        "'${it}' is not valid, '${propName}' has to be a valid boolean value (true / false)"
+                            }
+                    ) ?: true
+                }
+        ).toBoolean() as boolean,
+
+        jenkinsItemsDir: (
+                'liferay.workspace.ee.jenkins.items.dir'.with { propName ->
+                    findAndCheckProperty(
+                            propName,
+                            {
+                                assertUserData !new File(it).isAbsolute(),
+                                        "'${propName}' cannot be an absolute path, please use a relative one"
+                            }
+                    ) ?: ''
+                }
+        ) as String,
+
+        jenkinsManagedJobNames: (
+                use (StringCategory) {
+                    findProperty(
+                            'liferay.workspace.ee.jenkins.managed.job.names'
+                    )?.toListFromCommaSeparatedString() ?: []
+                }
+        ) as List,
+
+        jenkinsManagedViewNames: (
+                use (StringCategory) {
+                    findProperty(
+                            'liferay.workspace.ee.jenkins.managed.view.names'
+                    )?.toListFromCommaSeparatedString() ?: []
+                }
+        ) as List,
+
+        jenkinsInstalledPluginIds: (
+                use (StringCategory) {
+                    findProperty(
+                            'liferay.workspace.ee.jenkins.installed.plugin.ids'
+                    )?.toListFromCommaSeparatedString() ?: []
+                }
+        ) as List,
+
+
+        //
+        // Properties for 'aws' module
+        //
+
+        // Following AWS credentials should be set only using Gradle init script
+
+        awsAccessKey: (findProperty('awsAccessKey') ?: '') as String,
+        awsSecretKey: (findProperty('awsSecretKey') ?: '') as String,
+
+        // Following AWS properties are project-wide and should be set using 'gradle.properties'
+
+        awsAmiPrimaryRegion: (findProperty('liferay.workspace.ee.aws.ami.primary.region') ?: '') as String,
+
+        awsAmiBaseAmiId: (findProperty('liferay.workspace.ee.aws.ami.base.ami.id') ?: '') as String,
+
+        awsAmiBaseAmiLinuxPackagesFormat: (
+                'liferay.workspace.ee.aws.ami.base.ami.linux.packages.format'.with { propName ->
+                    findAndCheckProperty(
+                            propName,
+                            {
+                                def allowedValues = [ 'deb', 'rpm' ]
+
+                                assertUserData it in allowedValues,
+                                        "Value '${it}' is not allowed for '${propName}', please use only one of: " +
+                                                "${allowedValues.join(', ')}"
+                            }
+                    )
+                }
+        ) as String,
+
+        awsAmiBaseAmiSshUserName: (findProperty('liferay.workspace.ee.aws.ami.base.ami.ssh.user.name') ?: '') as String,
+
+        awsAmiBuildEc2InstanceType: (findProperty('liferay.workspace.ee.aws.ami.build.ec2.instance.type') ?: '') as String,
+
+        awsAmiBuildEc2InstanceVpcId: (findProperty('liferay.workspace.ee.aws.ami.build.ec2.vpc.id') ?: '') as String,
+
+        awsAmiBuildEc2SubnetId: (findProperty('liferay.workspace.ee.aws.ami.build.ec2.subnet.id') ?: '') as String,
+
+        awsAmiBuildIamInstanceProfile: (findProperty('liferay.workspace.ee.aws.ami.build.iam.instance.profile') ?: '') as String,
+
+        awsAmiPlatformKey: (findProperty('liferay.workspace.ee.aws.ami.platform.key') ?: '') as String,
+
+        awsAmiCopyToRegions: (
+                use (StringCategory) {
+                    findProperty(
+                            'liferay.workspace.ee.aws.ami.copy.to.regions'
+                    )?.toListFromCommaSeparatedString() ?: []
+                }
+        ) as List,
+
+        awsAmiPackerExtraProvisionersJsonFiles: (
+                use (StringCategory) {
+                    'liferay.workspace.ee.aws.ami.packer.extra.provisioners.json.files'.with { propName ->
+
+                        findAndCheckProperty(
+                                propName,
+                                {
+                                    assertListOfRelativeExistingFiles(it, propName)
+                                }
+                        )?.toListFromCommaSeparatedString() ?: []
+                    }
+                }
+        ) as List,
+
+        amiBuiltAmisRetentionCount: (
+                'liferay.workspace.ee.aws.ami.built.amis.retention.count'.with { propName ->
+                    findAndCheckProperty(
+                            propName,
+                            {
+                                assertUserData "${it}".isInteger() && it.toInteger() >= 0,
+                                        "'${propName}' has to be a non-negative integer"
+                            }
+                    ) ?: true
+                }
+        ).toInteger() as int,
+
+        //
+        // Properties for 'docker' module
+        //
+
+        dockerRepositoryCompany: (findProperty('liferay.workspace.ee.docker.repository.company') ?: '') as String,
+
+        dockerMaintainer: (findProperty('liferay.workspace.ee.docker.maintainer') ?: '') as String,
+
+        // TODO validate it's a space-delimited list of valid port numbers to catch typos?
+        dockerExpose: (findProperty('liferay.workspace.ee.docker.expose') ?: '') as String,
+
+        dockerPackerExtraProvisionersJsonFiles: (
+                use (StringCategory) {
+                    'liferay.workspace.ee.docker.packer.extra.provisioners.json.files'.with { propName ->
+
+                        findAndCheckProperty(
+                                propName,
+                                {
+                                    assertListOfRelativeExistingFiles(it, propName)
+                                }
+                        )?.toListFromCommaSeparatedString() ?: []
+                    }
+                }
+        ) as List
+]
+
+
+subprojects {
+    def baseProjectPath = ':liferay-workspace-ee:base'
+
+    if (it.path != baseProjectPath) {
+        // make sure 'base' is evaluated first, so the other modules see the changes
+        // done to the workspace (CE) tasks
+        it.evaluationDependsOn(baseProjectPath)
+    }
+}
+
+// Checks to be done when graph of tasks is ready and first task is about to be started
+
+gradle.taskGraph.whenReady { taskGraph ->
+
+    // TODO Packer supports credentials being read from IAM_ROLE (when run in EC2 instance)
+    // make sure that we require AWS credentials to be specified when building AMI
+    if (taskGraph.hasTask(':liferay-workspace-ee:aws:distBundleAmi') ||
+            taskGraph.hasTask(':liferay-workspace-ee:aws:listAvailableProjectAmis')) {
+
+        def missingAwsProperties = ["awsAccessKey", "awsSecretKey"].findAll { !findAndCheckProperty(it) }
+
+        if (!missingAwsProperties.isEmpty()) {
+            throw new InvalidUserDataException("Following project properties were not found: " +
+                    "${missingAwsProperties}. Make sure you provide these to Gradle when " +
+                    "using AWS-related task, like building AMIs. Use either using Gradle " +
+                    "init script (see 'init.workspace-ee-sample.gradle') or on command line ('-P...')")
+        }
+
+        if (taskGraph.hasTask(':liferay-workspace-ee:aws:distBundleAmi')) {
+            checkCommandExecutable(gradle.liferayWorkspaceEe.externalExecutables.packer)
+        }
+    }
+
+
+    if (gradle.liferayWorkspaceEe.jenkinsServerSecure) {
+        def jenkinsTasksPaths = [':liferay-workspace-ee:jenkins:installJenkinsPlugins']
+
+        ['delete', 'dumpRemote', 'retire', 'update', 'validate'].each { jenkinsCommand ->
+            jenkinsTasksPaths.add ":liferay-workspace-ee:jenkins:${jenkinsCommand}JenkinsJobs"
+            jenkinsTasksPaths.add ":liferay-workspace-ee:jenkins:${jenkinsCommand}JenkinsItems"
+        }
+
+        boolean hasJenkinsTask = taskGraph.allTasks.find { task ->
+            jenkinsTasksPaths.find { jenkinsTasksPath -> jenkinsTasksPath == task.path }
+        }
+
+        if (hasJenkinsTask) {
+            // make sure that we require Jenkins credentials if it is secured and one of Jenkins tasks is invoked
+            def missingJenkinsProperties = ["jenkinsUserName", "jenkinsPassword"].findAll {
+                !findAndCheckProperty(it)
+            }
+
+            if (!missingJenkinsProperties.empty) {
+                throw new InvalidUserDataException("Jenkins server is expected to be 'secure' " +
+                        "('liferay.workspace.ee.jenkins.server.secure' in 'gradle.properties' or " +
+                        "EE defaults in 'gradle.workspace-ee-defaults.properties'), but following project " +
+                        "properties were not found: ${missingJenkinsProperties}. Make sure you provide " +
+                        "these to Gradle when invoking Jenkins tasks, either using Gradle init script " +
+                        "(see 'init.workspace-ee-sample.gradle') or on command line ('-P...')")
+            }
+        }
+    }
+
+    // make sure that Tomcat is used as the base bundle, since LWE only supports Tomcat for now
+    if (taskGraph.hasTask(':liferay-workspace-ee:ospackage:distBundleDeb') ||
+            taskGraph.hasTask(':liferay-workspace-ee:ospackage:distBundleRpm')) {
+
+        // developer note: adding new supported bundle types means at least:
+        //  * adding the key to list of supported bundles in this file
+        //  * adding appropriate bundle type file with file to check in ospackage/bundle-types.gradle
+        //      * new SupportedBundleType enum value, its name matching the new key
+        //  * adding support for new bundle type throughout ospackage/ospackage.gradle
+        //      * tasks + versions of all OS scripts (most effort)
+        def supportedBundleTypes = [ 'tomcat' ]
+
+        def bundleType = gradle.liferayWorkspaceEe.bundleType
+
+        if (!(bundleType in supportedBundleTypes)) {
+            throw new InvalidUserDataException("Only Tomcat-based bundles are supported " +
+                    "for OS packages / AMIs / Docker images being built by Liferay Workspace EE, " +
+                    "but you've configured '${bundleType}' for this project. Please make " +
+                    "sure that your 'liferay.workspace.ee.bundle.type' is equal to 'tomcat'.")
+        }
+    }
+
+    if (taskGraph.hasTask(':liferay-workspace-ee:docker:distBundleDockerfile')) {
+        checkCommandExecutable(gradle.liferayWorkspaceEe.externalExecutables.packer)
+        checkCommandExecutable(gradle.liferayWorkspaceEe.externalExecutables.docker)
+    }
+}
+
+/**
+ * Loads given properties file and sets each key as a new 'ext' property of 'rootProject' if
+ * such property does not exist already on this object.
+ *
+ * @param type 'ee' or 'ms'
+ * @param defaultsFile
+ * @return
+ */
+def loadPropertiesDefaults(String type, File defaultsFile) {
+    def eeProperties= new Properties()
+
+    logger.info "[LWE] Loading default values of '${type}' properties from '${defaultsFile.absolutePath}'"
+
+    assert defaultsFile.exists()
+
+    defaultsFile.withInputStream { stream ->
+        eeProperties.load(stream)
+    }
+
+    logger.info "[LWE] Loaded ${eeProperties.size()} '${type}' properties"
+
+    eeProperties.keySet().each { key ->
+        def value = eeProperties.getProperty(key)
+
+        // it's enough to set the property only on rootProject, then both 'project.getProperty()' and
+        // 'rootProject.getProperty()' will be able to find it ('project.getProperty()' by default also
+        // checks all parent projects if property is not found on project itself)
+
+        if(!rootProject.hasProperty(key)) {
+            rootProject.ext[key] = value
+
+            logger.debug "[LWE] '${type}' property '${key}' created and set to default value '${rootProject.getProperty(key)}'"
+        }
+        else {
+            logger.debug "[LWE] '${type}' property '${key}' already exists and has value '${rootProject.getProperty(key)}'"
+        }
+    }
+}
+
+/**
+ * Checks that the project is using only supported workspace EE properties (properties
+ * with prefix liferay.workspace.ee.) This should catch any basic typos or use of
+ * removed properties after upgrading to newer version of workspace ee.
+ * 
+ * @param type 'ee' or 'ms'
+ * @param defaultsFile the file containing the allowed configuration keys
+ * @return
+ */
+def checkOnlySupportedPropertiesUsed(String type, File defaultsFile) {
+
+    String propertiesPrefix = "liferay.workspace.${type}."
+    
+    // we'll define the supported properties as the ones listed in given 'defaultsFile':
+    //      'gradle.workspace-ee-defaults.properties'
+    //      'gradle.workspace-ms-defaults.properties'
+
+    def supportedProperties = new Properties().with { defaultProps ->
+        defaultsFile.withReader {
+            defaultProps.load(it)
+        }
+
+        return defaultProps.stringPropertyNames()
+    }
+
+    def usedPropertiesWithGivenPrefix = rootProject.getProperties().keySet().findAll { it.startsWith(propertiesPrefix) }
+
+    def unsupportedProperties = usedPropertiesWithGivenPrefix.findAll { !(it in supportedProperties) }
+
+    assertUserData unsupportedProperties.isEmpty(),
+            "You have used one or more unsupported Workspace '${type}' properties:" +
+                    "${unsupportedProperties.collect { "\n  * ${it}" }.join('')}\n" +
+                    "Please check '${rootProject.relativePath(defaultsFile)}' for supported properties or " +
+                    "'gradle/liferay-workspace-ee/release-notes.md' for eventual changes " +
+                    "concerning given properties."
+}
+
+/**
+ * Attempts to find a task by its path and asserts it exists.
+ *
+ * @param path
+ * @return
+ */
+def findAndCheckWorkspaceTaskByPath (String path) {
+    def task = tasks.findByPath(path)
+
+    assert task != null,
+            "Cannot find the expected workspace task with path '${path}'), " +
+                    "was Liferay Workspace plugin applied in settings.gradle?"
+
+    return task
+}
+
+/**
+ * Makes sure given command is executable from Gradle as external process.
+ * Useful to check before running the command with real arguments to see if
+ * the dependency is available in user's OS.
+ *
+ * @param commandDefinition the definition of the command, example:
+ * <pre>
+ *  [
+ *      name               : 'packer',
+ *      executable         : (findAndCheckProperty('packerExecutable') ?: 'packer') as String,
+ *      validationArguments: ['version'],
+ *      downloadUrl        : 'https://www.packer.io',
+ *      configPropertyName : 'packerExecutable'
+ *  ]
+ * </pre>
+ *
+ * @throws InvalidUserDataException if given executable with given arguments cannot run or
+ *                                      if it does not return 0
+ */
+def checkCommandExecutable(Map commandDefinition) {
+    assert commandDefinition, "Cannot check command, passed definition is null"
+
+    def cd = commandDefinition
+
+    def commandToString = "${cd.executable} ${cd.validationArguments.join(' ')}"
+
+    try {
+        logger.quiet "Validating configured executable for '${cd.name}', running '${commandToString}' in command line..."
+
+        exec {
+            executable cd.executable
+            args cd.validationArguments
+        }
+    } catch (e) {
+        throw new InvalidUserDataException("Running command '${commandToString}' failed, do you have " +
+                "'${cd.name}' from ${cd.downloadUrl} installed on your machine? Make sure you can run '${commandToString}' " +
+                "in your command line, you can configure the path to the command with project property '${cd.configPropertyName}'. " +
+                "Make sure to restart Gradle daemon ('gradle --stop') if you changed your PATH recently.", e)
+    }
+}
+
+/**
+ * If property exist on current project, then returns its value, otherwise returns null.
+ *
+ * @param propertyName the property name (key)
+ * @param validationFn validation function called on the value (if found on the project)
+ * @return the value (if property exists on the project) or null
+ */
+def findAndCheckProperty(String propertyName, Closure validationFn = { Object value -> }) {
+    return findProperty(propertyName)?.with {
+        validationFn(it)
+
+        return it
+    }
+}
+
+/** Validates given condition if fine and throws exception if not. The condition
+ * can be any object, it will be evaluated using Groovy rules, see:
+ *      https://mrhaki.blogspot.cz/2009/08/groovy-goodness-tell-groovy-truth.html
+ *
+ * @param conditionToBeTrue
+ * @param message
+ */
+void assertUserData(Object conditionToBeTrue, String message) {
+    if (!conditionToBeTrue) {
+        throw new InvalidUserDataException(message)
+    }
+}
+
+/**
+ * Returns the version of project, determined from given source, if possible.
+ *
+ * This method can run before {@code sourceKey} is validated, so be prepared it
+ * can be empty or invalid source. If that case, this method returns null.
+ * @param sourceKey
+ * @return
+ */
+String determineProjectVersion(String sourceKey) {
+    // sourceKey can be null or empty
+
+    def source = ProjectVersionSource.from(sourceKey)
+
+    def fromGradle = {
+        def version =
+                (rootProject.version && rootProject.version != 'unspecified') ?
+                    rootProject.version.toString().toLowerCase():
+                    null
+
+        println "Determining project version from Gradle root project... ${version}"
+
+        return version
+    }
+
+    def fromGitBranch = {
+        try {
+            print "Determining project version from Git branch... "
+
+            // based on: https://mrhaki.blogspot.cz/2015/04/gradle-goodness-use-git-commit-id-in.html
+
+            // Open the Git repository in the current directory.
+            // looks up the .git dir in the specified directory or any parent until / is
+            // reached - in such exception is thrown
+            def git = org.ajoberstar.grgit.Grgit.open(currentDir: rootProject.projectDir)
+
+            def version = git?.branch?.current?.name?.toLowerCase()
+
+            println version
+            
+            return version
+        } catch (Exception e) {
+            println "Cannot fetch local git branch to determine project version: ${e}"
+
+            return null
+        }
+    }
+
+    def fallback = { fromGradle() }
+
+    switch (source) {
+        case ProjectVersionSource.GRADLE:
+            return fromGradle()
+
+        case ProjectVersionSource.GIT_BRANCH:
+            return fromGitBranch() ?: fallback()
+
+        default:
+            // this is fine, the keys are validated when 'projectVersionSource' is set
+            // and the whole Gradle build will be rejected
+            return null
+    }
+}
+
+void assertListOfRelativeExistingFiles(String commaSeparatedListOfValues, String propName) {
+    use (StringCategory) {
+        def values = commaSeparatedListOfValues.toListFromCommaSeparatedString()
+
+        def absoluteFiles = values.findAll { new File(it).isAbsolute() }
+
+        assertUserData absoluteFiles.isEmpty(),
+                "'${propName}' cannot contain absolute paths, but these are not:\n  * " +
+                        absoluteFiles.join('\n  * ')
+
+        def notExistingFiles = values.findAll { !new File(rootProject.projectDir, it).isFile() }
+
+        assertUserData notExistingFiles.isEmpty(),
+                "'${propName}' contains paths, which are not existing files in the project:\n  * " +
+                        notExistingFiles.join('\n  * ')
+    }
+}
+
+@Category(String)
+class StringCategory {
+
+    /**
+     * Transforms comma-separated list of values into List of Strings. Empty items
+     * are not included, all values are trimmed.
+     * @param value
+     * @return
+     */
+    List<String> toListFromCommaSeparatedString() {
+
+        // split by comma -> remove any whitespaces before + after from the items -> remove any empty items
+
+        return this.split(/,[\s]*/).collect { it.trim() }.findAll { it }
+    }
+
+}
+
+enum ProjectVersionSource {
+    GRADLE ('gradle'),
+    GIT_BRANCH ('git-branch')
+
+    ProjectVersionSource(String key) {
+        this.key = key
+    }
+
+    final String key
+
+    /**
+     * Returns the matching item or {@code null}.
+     *
+     * @param key
+     * @return
+     */
+    static ProjectVersionSource from(String key) {
+        return values().find { it.key == key }
+    }
+}

@@ -1,0 +1,470 @@
+/*
+ * Copyright (c) 2000-present Liferay, Inc. All rights reserved.
+ *
+ * The contents of this file are subject to the terms of the Liferay Enterprise
+ * Subscription License ("License"). You may not use this file except in
+ * compliance with the License. You can obtain a copy of the License by
+ * contacting Liferay, Inc. See the License for the specific language governing
+ * permissions and limitations under the License, including but not limited to
+ * distribution rights of the Software.
+ */
+
+// This file contains any useful changes made to the tasks / settings created by
+// the Liferay Workspace Plugin (CE); shoudl be included from liferay-workspace-ee.gradle
+
+import de.undercouch.gradle.tasks.download.Verify
+
+buildscript {
+    repositories {
+        // https://github.com/ajoberstar/grgit
+        jcenter()
+
+        // https://github.com/michel-kraemer/gradle-download-task
+        maven {
+            url 'https://plugins.gradle.org/m2/'
+        }
+    }
+
+    dependencies {
+        // https://github.com/ajoberstar/grgit
+        classpath 'org.ajoberstar:grgit:1.7.1'
+
+
+        // https://github.com/michel-kraemer/gradle-download-task
+        classpath 'de.undercouch:gradle-download-task:3.1.2'
+    }
+}
+
+def git
+def gitException
+
+try {
+    // based on: https://mrhaki.blogspot.cz/2015/04/gradle-goodness-use-git-commit-id-in.html
+
+    // Open the Git repository in the current directory.
+    // looks up the .git dir in the specified directory or any parent until / is
+    // reached - in such exception is thrown
+    git = org.ajoberstar.grgit.Grgit.open(currentDir: rootProject.projectDir)
+
+} catch (Exception e) {
+    gitException = e
+}
+
+ext {
+    // Get commit id of HEAD.
+    revisionId      = git?.head()?.id
+    branch          = git?.branch?.current
+    remotes         = git?.remote?.list()
+}
+
+task generateReleaseInfo {
+    description 'Generates release info file for currently built bundle.'
+    group 'Liferay Workspace EE - Base'
+
+    ext.file = file("${rootProject.buildDir}/release-info.txt")
+
+    doLast {
+        file.parentFile.mkdirs()
+
+        def now = new Date()
+
+        file.text = """\
+                    # Built by Liferay Workspace EE on ${now}                
+
+                    # Workspace build details
+
+                    project:        ${rootProject.name}
+                    environment:    ${gradle.liferayWorkspace.environment}
+                    projectVersion: ${gradle.liferayWorkspaceEe.projectVersion}
+                    releaseNumber:  ${gradle.liferayWorkspaceEe.releaseNumber}
+                           
+                    """.stripIndent()
+        if (git) {
+            file << """\
+                    # Git SCM information
+                    
+                    revisionId:     ${revisionId}
+                    branch:         ${branch?.name ?: 'none - detached HEAD'}
+                    trackingBranch: ${branch?.trackingBranch?.name ?: 'no tracked branch'}
+                    remotes:
+                    """.stripIndent()
+
+            remotes?.each {
+                file << """\
+                        |  - name: ${it.name}
+                        |    url:  ${it.url}
+                        |""".stripMargin()
+            }
+        }
+        else {
+            file << """
+                    # Git SCM information could not be loaded: 
+                    # ${gitException}
+                    """.stripIndent().trim()
+        }
+    }
+}
+
+
+// Functionality to remove the files we don't need from the bundle, when extracted
+// to be used by the workspace
+
+def distBundleTask = gradle.liferayWorkspaceEe.workspaceTasks.distBundle
+def initBundleTask = gradle.liferayWorkspaceEe.workspaceTasks.initBundle
+
+[ distBundleTask, initBundleTask ].each { Copy extractingDistTask ->
+
+    String bundleBaseDir = (extractingDistTask == distBundleTask) ?
+            "${rootProject.buildDir}/dist" : rootProject.file(gradle.liferayWorkspace.homeDir)
+    String bundleKey = (extractingDistTask == distBundleTask) ? "Dist" : 'Init'
+
+    def excludedFilesProperty = 'liferay.workspace.ee.bundle.exclude.files'
+
+    task "excluludeFilesFrom${bundleKey}Bundle" (type: Delete) {
+
+        onlyIf {
+            !gradle.liferayWorkspaceEe.bundleExcludeFiles.isEmpty()
+        }
+//            // TODO do not run this if downloadPatches fails; ideally, if any task before fails
+//
+//            // or if this one we run after fails...
+//            // ':liferay-workspace-ee:patches:runPatchingToolInstallIn${bundleKey}Bundle'
+//
+//            downloadPatchesTask.state.failure == null &&
+//        }
+
+        // Make sure the files are removed only after patches' installation was run, since
+        // fixpacks bring many of these files back
+        
+        mustRunAfter ":liferay-workspace-ee:patches:runPatchingToolInstallIn${bundleKey}Bundle"
+
+        delete gradle.liferayWorkspaceEe.bundleExcludeFiles.collect { "${bundleBaseDir}/${it}" }
+
+        doFirst {
+            // verify all files are present in the bundle, to catch typos / unexpected bundle's
+            // content changes
+
+            List<File> notExistingBundleFilesToBeDeleted = targetFiles.findAll { File removedFile -> !removedFile.exists() }
+
+            if (!notExistingBundleFilesToBeDeleted.isEmpty()) {
+                throw new InvalidUserDataException(
+                        "Some of the files to be excluded from the bundle (gradle.properties -> '${excludedFilesProperty}') " +
+                                "do not exist in the downloaded bundle:\n" +
+                                notExistingBundleFilesToBeDeleted.collect { "  * ${it.absolutePath - "${bundleBaseDir}/"}\n" }.join() +
+                                "Please check your configuration and make sure it matches the bundle you are using " +
+                                "(liferay.workspace.bundle.url)."
+                )
+            }
+        }
+        
+        doLast {
+            logger.info "[LWE] Files are being removed from bundle '${bundleBaseDir}'"
+
+            logger.quiet "Following files were removed from the bundle based on '${excludedFilesProperty}' (gradle.properties):"
+
+            targetFiles.each { File removedFile ->
+                logger.quiet "  * ${removedFile.absolutePath - "${bundleBaseDir}/"}"
+            }
+        }
+    }
+
+    extractingDistTask.finalizedBy "${project.path}:excluludeFilesFrom${bundleKey}Bundle"
+}
+
+
+// Update ':distBundleZip' and ':distBundleTar':
+// (1) include environment, version and release number in the archive's file name
+// (2) place release info into the archives
+
+Zip distBundleZipTask = gradle.liferayWorkspaceEe.workspaceTasks.distBundleZip
+Tar distBundleTarTask = gradle.liferayWorkspaceEe.workspaceTasks.distBundleTar
+
+[ distBundleZipTask, distBundleTarTask ].each { distTask ->
+    distTask.with {
+        dependsOn generateReleaseInfo
+
+        // follow the .deb naming pattern and always attach the environment,
+        // version and release number at the end of .zip / .tar.gz file name
+
+        baseName += ".${gradle.liferayWorkspace.getEnvironment()}"
+        baseName += "_${gradle.liferayWorkspaceEe.projectVersion}"
+        baseName += "-${gradle.liferayWorkspaceEe.releaseNumber}"
+
+        // put as simple release info into the bundle, so when extracted (from
+        // .zip / .tar.gz), it's clear from where the bundle files are originating
+
+        from(generateReleaseInfo.file.absolutePath)
+
+        doLast {
+            def archiveSizeMB = ((double) project.rootProject.file(getArchivePath()).size() / (1000 * 1000))
+
+            def archiveSize =
+                    (archiveSizeMB < 1000) ?
+                            "${archiveSizeMB.round(2)} MB" :
+                            "${(archiveSizeMB / 1000).round(2)} GB"
+
+            logger.quiet "Assembled Liferay bundle archive '${project.rootProject.relativePath(getArchivePath())}' (${archiveSize})"
+        }
+    }
+}
+
+
+//
+// Enhance and optimize the ':downloadBundle' task used for fetching the bundle
+//
+
+//0f9a383278fd6ec90cf267cf12726241a429ba2756d7bfabfcf5ea5d126f6098  liferay-dxp-digital-enterprise-tomcat-7.0-ga1-20160617092557801_minimalist.zip
+def knownBundlesSha256Checksum = [
+        // 6.2 EE
+        // TODO should we download and compute checksums for all of the SPs?
+        'liferay-portal-tomcat-6.2-ee-sp12-20151105114451508.zip': '948af4573554de88296aac0db47fc988e327b731b304cbb11b3f8d82a75a192d',
+        'liferay-portal-tomcat-6.2-ee-sp13-20151105114451508.zip': '0229ee56e02d1c90632ab374fbea5f55d8b46b7e886deca197e34f198cc3ee99',
+        'liferay-portal-tomcat-6.2-ee-sp14-20151105114451508.zip': '19e72792410cdbb680c39c5ed60ebdb99c6fd90998499e65701a22481d433101',
+        'liferay-portal-tomcat-6.2-ee-sp17-20161202155558436.zip': '584fa4494fdfa2ba537a3642bd914ecd07ac0fdcbc31847b125de8106510a8df',
+        'liferay-portal-tomcat-6.2-ee-sp18-20170306151705459.zip': '823bea8a79c3f41d838e729ffc91a73b778cf5a65c78e1022d95b62bf70d9710',
+        'liferay-portal-tomcat-6.2-ee-sp19-20170515190514275.zip': '8ea540055bb3267cc4d318bc0d880f983f8d9a2538494e368b737512543faad5',
+
+        // 7.0 CE
+        'liferay-portal-tomcat-7.0-ce-ga1-20160331161017956.zip': '412618d9014d64dee884ee687569a63b603bb4e53a50ba5b88e64ac3bfcf07a2',
+        'liferay-ce-portal-tomcat-7.0-ga2-20160610113014153.zip': 'e78f6c727ab22d438e705fd1f17264983a835deed2f3669fecc2840cc02b7e72',
+        'liferay-ce-portal-tomcat-7.0-ga3-20160804222206210.zip': 'ee58fb3285715e50d89d03c780ddfb7180837a53f7a029e70cded39cb84debeb',
+
+        // DXP
+        'liferay-dxp-digital-enterprise-tomcat-7.0-ga1-20160617092557801.zip': '89a32b00fea92b37bb84fdab969f2037d5082c111a1b016cf7c63bf219cde379',
+        'liferay-dxp-digital-enterprise-tomcat-7.0-sp1-20161027112321352.zip': '89ba6c75d86386c13ad24ac297768125c914de387f46279d461f7e8801884174',
+        'liferay-dxp-digital-enterprise-tomcat-7.0-sp2-20170317165321327.zip': 'bc3ecf96b98987aa55b1e5baa33d39a3e407dbaaf7ee91cc93374821a156087d',
+        'liferay-dxp-digital-enterprise-tomcat-7.0-sp3-20170503123037723.zip': '90b71a970cf049a13599e5e2a14b4b7f87146be3d92c53275c92d23dcd3f7a94',
+        'liferay-dxp-digital-enterprise-tomcat-7.0-sp4-20170705142422877.zip': 'fbfdb531ca2f592e6992c7b068574c8e4c0ae5d51e1b28a6de923484d45c9ade',
+        'liferay-dxp-digital-enterprise-tomcat-7.0-sp5-20170911000021895.zip': '9dff56b6ea0f785f3f8bf51b928985114ef38679c2e7dd682b2ca6eea5c8a261'
+]
+
+def downloadBundleTask = gradle.liferayWorkspaceEe.workspaceTasks.downloadBundle
+
+downloadBundleTask.ext.getArchivePath = {
+    // possible valid values:
+    //      https://example.com/liferay.zip
+    //      file:///opt/liferay.zip
+    assert gradle.liferayWorkspace.bundleUrl.contains('/'),
+            "Invalid liferay.workspace.bundle.url - does not contain even one '/'"
+
+    def bundleName = gradle.liferayWorkspace.bundleUrl.with { String url ->
+        url.substring(url.lastIndexOf('/'))
+    }
+
+    return new File(downloadBundleTask.dest, bundleName)
+}
+
+// (1) verify the downloaded bundle's SHA checksum
+
+task verifyBundle(type: Verify) {
+    def bundleFileName = downloadBundleTask.getArchivePath().name
+    def bundleChecksum = knownBundlesSha256Checksum[bundleFileName] ?: gradle.liferayWorkspaceEe.bundleSha256Checksum
+
+    description "Verifies that the downloaded Liferay bundle (${downloadBundleTask.getArchivePath()}) " +
+            "is valid based on its checksum."
+
+    group 'Liferay Workspace EE - Base'
+
+    dependsOn downloadBundleTask
+
+    onlyIf {
+        downloadBundleTask.state.failure == null
+    }
+
+    src downloadBundleTask.getArchivePath()
+
+    algorithm 'SHA-256'
+    checksum bundleChecksum
+
+    doFirst {
+        if(!bundleChecksum) {
+            throw new InvalidUserDataException(
+                    "The SHA-256 checksum of your bundle is not known, please provide project property " +
+                            "'liferay.workspace.ee.bundle.sha256.checksum' so that we can verify the downloaded " +
+                            "bundle '${bundleFileName}' is not corrupt.")
+        }
+    }
+}
+
+downloadBundleTask.finalizedBy verifyBundle
+
+boolean bundleDownloadedFromPrivateLiferayServers = gradle.liferayWorkspace.bundleUrl.with {
+    // TODO add any other domain which will host DXP (EE) bundles
+
+    startsWith('http://files.liferay.com') || startsWith('https://files.liferay.com')
+}
+
+if (bundleDownloadedFromPrivateLiferayServers) {
+
+    // (2) we're fetching bundle from 'files.liferay.com', most likely a DXP (EE)
+    // bundle => require credentials
+
+    def downloadBundleUrlDomain = new URL(gradle.liferayWorkspace.bundleUrl).host
+    
+
+    // 'dest' is a standard property of the 'downloadBundle' task
+    def cachedBundleFile = downloadBundleTask.getArchivePath()
+
+    // we know this domain requires auth (HTTP Basic) for fetching, so provide
+    // a note in case of download's failure, hinting at possible auth error
+
+    task downloadBundleNote() {
+
+        onlyIf {
+            downloadBundleTask.state.failure != null
+        }
+
+        doLast {
+            // Make sure to give a hint to user if 'downloadBundle' fails. This task
+            // is finalizing 'downloadBundle', so it will run even on the failure
+            // of 'downloadBundle'
+
+            println """\
+                    |
+                    |NOTE: Make sure to provide valid '${downloadBundleUrlDomain}' credentials to Gradle:
+                    |   * 'downloadBundleUserName' 
+                    |   * 'downloadBundlePassword'
+                    |  using e.g. init script file (see init.workspace-ee-sample.gradle), otherwise 
+                    |  the needed bundle will not be downloaded.
+                    | 
+                    |  Alternatively, you can set up credentials for the 'downloadBundle' task in the root 
+                    |  project's build.gradle.
+                    |
+                    |  You can also download the bundle manually (liferay.workspace.bundle.url): 
+                    |       ${gradle.liferayWorkspace.bundleUrl} 
+                    |  and place it into your local cache:
+                    |       ${cachedBundleFile.parentFile.absolutePath}                         
+                    |  to make it available to this workspace build.
+                    |""".stripMargin()
+        }
+    }
+
+    downloadBundleTask.with {
+        finalizedBy downloadBundleNote
+
+        // Once we got the file (downloaded it in the past), we don't need to check
+        // whether it was updated on the server (check headers like Last-Modified
+        // against local file). We want to re-fetch only when the file name in the URL
+        // ('liferay.workspace.bundle.url' in gradle.properties) changes.
+
+        // When we change the URL but keep the file name part the same (e.g. we
+        // move the file to other location on the server), the task will be still
+        // up-to-date. It's a limitation we can live with - if the file's name did not
+        // change, we can assume it's still the same file, even through in different
+        // server directory.
+
+        overwrite false
+
+        // We fill be downloading from files.liferay.com (see bundleDownloadedFromPrivateLiferayServers),
+        // which always requires Basic Auth in every HTTP request
+
+        if (!credentials) {
+            username username ?: findProperty('downloadBundleUserName')
+            password password ?: findProperty('downloadBundlePassword')
+
+            // do not 'require' the properties, since we have a nice note task (downloadBundleNote)
+            // explaining what might have went wrong
+        }
+    }
+}
+
+
+// Give possibility to archive sources of all custom modules created in the workspace
+task archiveCustomModulesSources(type: Zip) {
+
+    // What the? Why are these properties not in 'gradle.liferayWorkspace' object as e.g. modulesDir?
+    def modulesDir = findProperty('liferay.workspace.modules.dir') ?: 'modules'
+    def themesDir =  findProperty('liferay.workspace.themes.dir') ?: 'themes'
+    def warsDir =    findProperty('liferay.workspace.wars.dir') ?: 'wars'
+
+    def packagedDirs = [ modulesDir, themesDir, warsDir ]
+
+    group 'Liferay Workspace EE - Base'
+    description "Packages sources of all modules (directories ${packagedDirs.join(', ')})"
+
+    from(rootProject.file(modulesDir)) {
+        into 'modules'
+
+        include '**/src/**'
+        include '**/build.gradle'
+        include '**/bnd.bnd'
+    }
+
+    from(rootProject.file(themesDir)) {
+        into 'themes'
+
+        include '**/src/**'
+        include '**/gulpfile.js'
+        include '**/package.json'
+
+        // the node_modules in a theme have 'src' dirs inside, like 'themes/jarvis-theme/node_modules/node-sass/src/sass_types/...'
+        // so exclude them
+        exclude '**/node_modules/**'
+    }
+
+    from(rootProject.file(warsDir)) {
+        into 'wars'
+
+        include '**/src/**'
+        include '**/build.gradle'
+    }
+
+    // added by Workspace plugin to prevent empty directories (on top-level)
+    include '.touch'
+
+    includeEmptyDirs = false
+
+    destinationDir rootProject.buildDir
+    archiveName "${distBundleZipTask.baseName}_modules-src.zip"
+
+    doFirst {
+        getArchivePath().delete()
+    }
+
+    doLast {
+        println "Sources of custom modules (directories ${packagedDirs.join(', ')}) " +
+                "were archived as ${rootProject.relativePath(getArchivePath())}"
+    }
+}
+
+if (gradle.liferayWorkspaceEe.persistsNpmNodeModulesCache) {
+
+    // Make sure the NPM cache (used for building themes) is not wiped out
+    // with every 'clean' of the workspace. Path chosen based on 'LiferayCIPlugin':
+    //      https://github.com/liferay/liferay-portal/blob/fb4ffbeb568b622d2e33e009eb4c235690b4232b/modules/sdk/gradle-plugins-defaults/src/main/java/com/liferay/gradle/plugins/defaults/internal/LiferayCIPlugin.java#L222
+    //
+    File nodeModulesCacheDir = new File(System.getProperty('user.home'), '.liferay/node-modules-cache')
+
+    // looks like 'npmInstall' would complain if dir is missing, so create it beforehand
+    nodeModulesCacheDir.mkdirs()
+
+    rootProject.allprojects {
+        // configure NPM cache based on instructions from David Truong
+
+        // The task 'npmInstall' is only added after the child project (~ :themes:jarvis-theme)
+        // is evaluated; before then, no tasks added by Liferay Workspace plugin are in the 'tasks' container
+        
+        afterEvaluate {
+
+            // cannot use 'tasks.withType(com.liferay.gradle.plugins.node.tasks.NpmInstallTask)' because
+            //      (1) the class is not on classpath, most likely because the plugin is applied in settings.gradle
+            //      (2) even after adding the plugin's jar to classpath ('com.liferay:com.liferay.gradle.plugins.node:2.0.2')
+            //          to fix (1), the withType() won't match any task; it's most likely because the class
+            //          will be loaded by two different class loaders (settings.gradle when adding task vs.
+            //          build.gradle when searching for the task);
+            //
+            // So rather use matching by task's name; not even class name, since the effective class name of the task
+            // will be String value 'com.liferay.gradle.plugins.node.tasks.NpmInstallTask_Decorated', which we better
+            // not depend on; on the other hand, task's name 'npmInstall' should be pretty stable fact
+            //
+            tasks.matching { it.name == "npmInstall" }.each { npmInstallTask ->
+                npmInstallTask.nodeModulesCacheDir = nodeModulesCacheDir
+
+                npmInstallTask.doFirst {
+                    println "Using custom Node modules' cache: '${nodeModulesCacheDir.absolutePath}' " +
+                            "(see 'liferay.workspace.ee.persist.npm.node.modules.cache' in gradle.properties)"
+                }
+            }
+        }
+    }
+}

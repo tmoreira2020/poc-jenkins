@@ -1,0 +1,9 @@
+@LIFERAY_HOME@/@LIFERAY_HOME_APP_SERVER_DIR_NAME@/logs/catalina.out {
+    compress
+    copytruncate
+    create 644 @LIFERAY_USER@ @LIFERAY_GROUP@
+    daily
+    maxsize 100M
+    missingok
+    rotate 14
+}

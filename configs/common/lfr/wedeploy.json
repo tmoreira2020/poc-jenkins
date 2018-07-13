@@ -1,0 +1,15 @@
+{
+	"id": "lfr",
+	"image": "@liferay.workspace.wedeploy.liferay.image@",
+	"memory": 4096,
+	"cpu": 8,
+	"env": {
+	},
+	"dependencies": [
+		"dba",
+		"els"
+	],
+	"volumes": {
+		"data": "/opt/liferay/data"
+	}
+}

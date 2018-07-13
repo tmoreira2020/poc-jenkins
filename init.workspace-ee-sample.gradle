@@ -1,0 +1,73 @@
+/*
+ * Copyright (c) 2000-present Liferay, Inc. All rights reserved.
+ *
+ * The contents of this file are subject to the terms of the Liferay Enterprise
+ * Subscription License ("License"). You may not use this file except in
+ * compliance with the License. You can obtain a copy of the License by
+ * contacting Liferay, Inc. See the License for the specific language governing
+ * permissions and limitations under the License, including but not limited to
+ * distribution rights of the Software.
+ */
+
+////
+//// Use this script file as a sample on how to pass properties to Gradle build which
+//// are user-specific (and possibly sensitive) and should not be put into source control.
+////
+
+// Usage:
+//      ./gradlew --init-script=init.gradle distBundleZip
+//
+// The project properties are set in the init script through SystemProperties, Gradle
+// will parse these and set project properties accordingly. For details, see Gradle docs:
+//      * https://docs.gradle.org/current/userguide/init_scripts.html
+//      * https://docs.gradle.org/current/userguide/build_environment.html#sec:gradle_properties_and_system_properties
+
+// If you are interested in using encrypted Gradle store, please check the sample
+// in file 'init.workspace-ee-sample-encrypted.gradle'.
+
+allprojects { Project project ->
+    project.ext {
+        // Following two properties can be used to set credentials for 'downloadBundle' task
+        // fetching the Liferay bundle from 'liferay.workspace.bundle.url'
+
+        downloadBundleUserName = 'john.doe'
+        downloadBundlePassword = 'your-secret-password'
+
+        // Following two properties can be used to set credentials for 'downloadPatches' and
+        // 'downloadPatchingTool' tasks fetching the configured patches / patching tool
+        // from files.liferay.com
+
+        downloadPatchesUserName = 'john.doe'
+        downloadPatchesPassword = 'your-secret-password'
+
+        // The credentials for https://repository.liferay.com/nexus; used to upgrade workspace EE
+        // using the tasks in gradle/liferay-workspace-ee/upgrade-workspace-ee/upgrade-workspace-ee.gradle
+
+        liferayRepositoryUserName = 'john.doe'
+        liferayRepositoryPassword = 'your-secret-password'
+
+        // Following two properties can be used to set credentials for 'downloadOracleJdk' task
+        // fetching the Oracle JDK bundle from oracle.com
+
+        downloadOracleJdkUserName = 'john.doe@acme.com'
+        downloadOracleJdkPassword = 'your-secret-oracle-password'
+
+        // Properties for interacting with AWS, like building AMIs
+
+        awsAccessKey = 'your ACCESS key goes here'  // sample: AKIAITSPLG525ZTLDBPQ
+        awsSecretKey = 'your SECRET key goes here'  // sample: oNJQFy0zbs+44ldpEMwKP5ZXY2ovlHioqIGn3rrm
+
+        // Properties for interacting with Jenkins, like creating / listing jobs
+
+        jenkinsUserName = 'jenkins username'
+        jenkinsPassword = 'jenkins password or API token'
+
+        
+        // You can set absolute paths for Packer / Docker commands used by Gradle if these tools
+        // are not available in your PATH or if you want to use specific version of this tools
+        // in known location.
+
+        packerExecutable = '/opt/liferay/packer-1.0.0/packer'
+        dockerExecutable = '/opt/liferay/docker_17.03.1-ce/bin/docker'
+    }
+}

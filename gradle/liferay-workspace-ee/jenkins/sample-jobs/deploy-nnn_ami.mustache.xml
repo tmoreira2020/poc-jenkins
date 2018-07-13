@@ -1,0 +1,134 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project>
+  <actions/>
+  <description>Deploys the chosen AMI from 'build-nnn (AMI)' using CloudFormation template for app servers.
+
+TODO:
+  (1) Make a copy of this job for the environment you want to build, e.g. create a job
+      named 'deploy-dev_ami'
+  (2) Once created, configure the new job
+  (3) Search the page (Ctrl / command + F in browser) for every occurence of 'nnn' and
+      replace it with the name of your environment as created in Liferay Workspace sources,
+      like 'dev'.
+  (4) Select appropriate credentials. You might need to create them first in your Jenkins.
+      Following are needed for this job:
+      - AWS credentials (access and secret key) for CloudFormation plugin
+        * use / create 'Username with password' type of credentials in Jenkins, where
+          username = access key and password = secret key
+        * for the values, check the 'JenkinsBuildUser...' outputs from CloudFormation template used
+          to build your Jenkins (e.g. CF stack lfrgs-liferay-jarvis-jenkins, if used)
+  (5) Select the region where you built your AMIs (Liferay Workspace EE configuration) and
+      therefore where your CloudFormation stack will reside. Default in the job is 'us-east-1'.
+      - Remember to also change the 'AmiId=$AMI_US_EAST_1' to make sure the correct AMI ID
+        will be read from 'ami-ids.properties'
+  </description>
+  <displayName>SAMPLE deploy-nnn (AMI)</displayName>
+  <keepDependencies>false</keepDependencies>
+  <properties>
+    <jenkins.model.BuildDiscarderProperty>
+      <strategy class="hudson.tasks.LogRotator">
+        <daysToKeep>-1</daysToKeep>
+        <numToKeep>-1</numToKeep>
+        <artifactDaysToKeep>-1</artifactDaysToKeep>
+        <artifactNumToKeep>100</artifactNumToKeep>
+      </strategy>
+    </jenkins.model.BuildDiscarderProperty>
+    <hudson.model.ParametersDefinitionProperty>
+      <parameterDefinitions>
+        <hudson.plugins.copyartifact.BuildSelectorParameter plugin="copyartifact@1.38.1">
+          <name>BUILD_TO_COPY_FOR_DEPLOY</name>
+          <description>Please select the build # you want to deploy. AMI ID and CloudFormation template from that build will be used to redeploy the app servers.</description>
+          <defaultSelector class="hudson.plugins.copyartifact.SpecificBuildSelector">
+            <buildNumber>lastSuccessfulBuild</buildNumber>
+          </defaultSelector>
+        </hudson.plugins.copyartifact.BuildSelectorParameter>
+      </parameterDefinitions>
+    </hudson.model.ParametersDefinitionProperty>
+    <EnvInjectJobProperty plugin="envinject@2.1">
+      <info>
+        <propertiesContent>LFR_WORKSPACE_ENV=nnn</propertiesContent>
+        <secureGroovyScript plugin="script-security@1.27">
+          <script/>
+          <sandbox>false</sandbox>
+        </secureGroovyScript>
+        <loadFilesFromMaster>false</loadFilesFromMaster>
+      </info>
+      <on>true</on>
+      <keepJenkinsSystemVariables>true</keepJenkinsSystemVariables>
+      <keepBuildVariables>true</keepBuildVariables>
+      <overrideBuildParameters>false</overrideBuildParameters>
+    </EnvInjectJobProperty>
+  </properties>
+  <scm class="hudson.scm.NullSCM"/>
+  <canRoam>true</canRoam>
+  <disabled>true</disabled>
+  <blockBuildWhenDownstreamBuilding>false</blockBuildWhenDownstreamBuilding>
+  <blockBuildWhenUpstreamBuilding>false</blockBuildWhenUpstreamBuilding>
+  <jdk>(System)</jdk>
+  <triggers/>
+  <concurrentBuild>false</concurrentBuild>
+  <builders>
+    <hudson.tasks.Shell>
+      <command># Clean the workspace, remove any stale files copied by previous runs
+rm -rf *</command>
+    </hudson.tasks.Shell>
+    <hudson.plugins.copyartifact.CopyArtifact plugin="copyartifact@1.38.1">
+      <project>build-nnn_ami</project>
+      <filter>build/{{ LiferayWorkspaceProjectName }}-${LFR_WORKSPACE_ENV}-appServers.cloudformation-template.json, build/ami-ids.properties, build/*.ami-id.txt</filter>
+      <target/>
+      <excludes/>
+      <selector class="hudson.plugins.copyartifact.ParameterizedBuildSelector">
+        <parameterName>BUILD_TO_COPY_FOR_DEPLOY</parameterName>
+      </selector>
+      <flatten>true</flatten>
+      <doNotFingerprintArtifacts>false</doNotFingerprintArtifacts>
+      <resultVariableSuffix>BUILD_AMI</resultVariableSuffix>
+    </hudson.plugins.copyartifact.CopyArtifact>
+    <EnvInjectBuilder plugin="envinject@2.1">
+      <info>
+        <propertiesFilePath>ami-ids.properties</propertiesFilePath>
+      </info>
+    </EnvInjectBuilder>
+    <com.syncapse.jenkinsci.plugins.awscloudformationwrapper.CloudFormationBuildStep plugin="jenkins-cloudformation-plugin@1.2">
+      <stacks>
+        <com.syncapse.jenkinsci.plugins.awscloudformationwrapper.PostBuildStackBean>
+          <stackName>{{ LiferayWorkspaceProjectName }}-${LFR_WORKSPACE_ENV}-appServers</stackName>
+          <description/>
+          <cloudFormationRecipe>{{ LiferayWorkspaceProjectName }}-nnn-appServers.cloudformation-template.json</cloudFormationRecipe>
+          <parameters>AmiId=$AMI_US_EAST_1,BuildNumber=$COPYARTIFACT_BUILD_NUMBER_BUILD_AMI</parameters>
+          <timeout>1800</timeout>
+          <awsAccessKey>$ACCESS_KEY</awsAccessKey>
+          <awsSecretKey>$SECRET_KEY</awsSecretKey>
+          <sleep>0</sleep>
+          <awsRegion>US_East_Northern_Virginia</awsRegion>
+        </com.syncapse.jenkinsci.plugins.awscloudformationwrapper.PostBuildStackBean>
+      </stacks>
+    </com.syncapse.jenkinsci.plugins.awscloudformationwrapper.CloudFormationBuildStep>
+  </builders>
+  <publishers>
+    <hudson.tasks.ArtifactArchiver>
+      <artifacts>*</artifacts>
+      <allowEmptyArchive>false</allowEmptyArchive>
+      <onlyIfSuccessful>false</onlyIfSuccessful>
+      <fingerprint>false</fingerprint>
+      <defaultExcludes>true</defaultExcludes>
+      <caseSensitive>true</caseSensitive>
+    </hudson.tasks.ArtifactArchiver>
+    <hudson.tasks.Mailer plugin="mailer@1.20">
+      <recipients>{{ NotificationEmail }}</recipients>
+      <dontNotifyEveryUnstableBuild>false</dontNotifyEveryUnstableBuild>
+      <sendToIndividuals>false</sendToIndividuals>
+    </hudson.tasks.Mailer>
+  </publishers>
+  <buildWrappers>
+    <org.jenkinsci.plugins.credentialsbinding.impl.SecretBuildWrapper plugin="credentials-binding@1.11">
+      <bindings>
+        <org.jenkinsci.plugins.credentialsbinding.impl.UsernamePasswordMultiBinding>
+          <credentialsId>e0844b76-8721-43e4-bc38-8c998fdf521c</credentialsId>
+          <usernameVariable>ACCESS_KEY</usernameVariable>
+          <passwordVariable>SECRET_KEY</passwordVariable>
+        </org.jenkinsci.plugins.credentialsbinding.impl.UsernamePasswordMultiBinding>
+      </bindings>
+    </org.jenkinsci.plugins.credentialsbinding.impl.SecretBuildWrapper>
+  </buildWrappers>
+</project>

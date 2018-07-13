@@ -1,0 +1,11 @@
+{
+	"id": "dba",
+	"image": "@liferay.workspace.wedeploy.database.image@",
+	"memory": 1024,
+	"cpu": 2,
+	"env": {
+		"MYSQL_DATABASE": "lportal",
+		"MYSQL_ROOT_PASSWORD": "mypassw0rd"
+	},
+	"zeroDowntime": false
+}

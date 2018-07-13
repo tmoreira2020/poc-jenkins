@@ -1,0 +1,7 @@
+The XML files are Mustache templates, with variables being replaced by the build before they are used for this project.
+
+* {{ LiferayWorkspaceProjectName }}
+        The name of the Gradle project (the rootProject = as used by the workspace), like 'lfrgs-liferay-jarvis'
+
+* {{ NotificationEmail }}
+        The email used for email notifications, like 'lfrgs-liferay-jarvis@liferay.com'

@@ -1,0 +1,68 @@
+/*
+ * Copyright (c) 2000-present Liferay, Inc. All rights reserved.
+ *
+ * The contents of this file are subject to the terms of the Liferay Enterprise
+ * Subscription License ("License"). You may not use this file except in
+ * compliance with the License. You can obtain a copy of the License by
+ * contacting Liferay, Inc. See the License for the specific language governing
+ * permissions and limitations under the License, including but not limited to
+ * distribution rights of the Software.
+ */
+
+//
+// This file is supposed to be located in 'gradle/liferay-workspace-ee' and
+// loaded from and being included by 'settings.gradle' (using '(apply from:...)')
+//
+
+// Liferay Workspace EE will use 'project.name' as package name for DEB / RPM
+// archives and also to name the built files.
+//
+// It's strongly recommended to name your project explicitly (Gradle uses rootProject's
+// directory name as default, which might not be accurate).
+
+
+//rootProject.name = 'liferay-project-abc'
+
+//
+// Load (include) the extra sub-projects adding the EE features
+//
+
+// Based on 'https://github.com/gradle/gradle/blob/master/settings.gradle'
+include 'liferay-workspace-ee'
+include 'liferay-workspace-ee:base'
+include 'liferay-workspace-ee:aws'
+include 'liferay-workspace-ee:jenkins'
+include 'liferay-workspace-ee:ospackage'
+include 'liferay-workspace-ee:docker'
+include 'liferay-workspace-ee:patches'
+include 'liferay-workspace-ee:upgrade-workspace-ee'
+
+def rootEeProject = project(":liferay-workspace-ee")
+assert rootEeProject.parent == rootProject
+
+(rootEeProject.children + rootEeProject).each { eeProject ->
+
+    logger.info "[LWE] Configuring EE subproject '${eeProject.path}'"
+
+    // relative to root of the Gradle project
+    String eeProjectDirPath = "gradle/${eeProject.path.replace(":", "/")}"
+    eeProject.projectDir = new File(settingsDir, eeProjectDirPath)
+    eeProject.buildFileName = "${eeProject.name}.gradle"
+
+    assert eeProject.projectDir.isDirectory()
+    assert eeProject.buildFile.isFile()
+    assert eeProject.parent == rootEeProject || (eeProject == rootEeProject && eeProject.parent == rootProject)
+}
+
+
+// enforce Gradle version to be 2.14+ or 3.0+, since we use some newer syntax and features
+
+def gradleVersion = org.gradle.util.GradleVersion.current().baseVersion.version
+
+if (gradleVersion.with { startsWith('0.') || startsWith('1.') || (startsWith('2.') && !startsWith('2.14')) }) {
+    throw new IllegalStateException(
+            "ERROR: Gradle 2.14+ or 3+ is required for liferay-workspace-ee, but '${gradleVersion.version}' " +
+                    "is being used. Please change your Gradle Wrapper config " +
+                    "(/gradle/wrapper/gradle-wrapper.properties) or use 'gradle' binary " +
+                    "which is from supported Gradle installation.");
+}

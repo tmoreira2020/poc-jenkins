@@ -1,0 +1,502 @@
+import com.amazonaws.regions.Regions
+import groovy.transform.Immutable
+import groovyx.gpars.GParsPool
+
+import com.amazonaws.auth.AWSStaticCredentialsProvider
+import com.amazonaws.auth.BasicAWSCredentials
+import com.amazonaws.services.autoscaling.AmazonAutoScalingClient
+import com.amazonaws.services.autoscaling.AmazonAutoScalingClientBuilder
+import com.amazonaws.services.autoscaling.model.DescribeLaunchConfigurationsRequest
+import com.amazonaws.services.ec2.AmazonEC2Client
+import com.amazonaws.services.ec2.AmazonEC2ClientBuilder
+import com.amazonaws.services.ec2.model.DescribeImagesRequest
+import com.amazonaws.services.ec2.model.DescribeInstancesRequest
+import com.amazonaws.services.ec2.model.DescribeSnapshotsRequest
+import com.amazonaws.services.ec2.model.Filter
+import com.amazonaws.services.ec2.model.DeregisterImageRequest
+import com.amazonaws.services.ec2.model.DeleteSnapshotRequest
+
+// Based on: https://docs.aws.amazon.com/sdk-for-java/v1/developer-guide/setup-project-gradle.html
+
+buildscript {
+    repositories {
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.amazonaws:aws-java-sdk-ec2:1.11.207'             // to access AWS API
+        classpath 'com.amazonaws:aws-java-sdk-autoscaling:1.11.207'     // to access AWS API
+        classpath 'org.codehaus.gpars:gpars:1.2.1'                      // for GparsPool concurrency
+    }
+}
+
+ext {
+    accessKey = gradle.liferayWorkspaceEe.awsAccessKey
+    secretKey = gradle.liferayWorkspaceEe.awsSecretKey
+
+    primaryRegion = gradle.liferayWorkspaceEe.awsAmiPrimaryRegion
+    secondaryRegions = gradle.liferayWorkspaceEe.awsAmiCopyToRegions
+
+    workspaceProjectName = rootProject.name
+
+    // if the EE property was provided, use it. It may be multiple environments
+    environments = gradle.liferayWorkspaceEe.environments ?: [ gradle.liferayWorkspace.environment ]
+
+    amisCountToKeep = gradle.liferayWorkspaceEe.amiBuiltAmisRetentionCount
+}
+
+// temporary test parameters against liferay-gs-mhan
+//primaryRegion = 'eu-central-1'
+//secondaryRegions = [ 'us-east-1', 'us-west-2' ]
+//amisCountToKeep = 1
+//workspaceProjectName = 'liferay-dxp-digital-enterprise-tomcat-7.0-sp1'
+//environments = [ 'dev' ]
+
+
+ext.projectRegions = [ primaryRegion ] + secondaryRegions
+
+
+task listAvailableProjectAmis() {
+    group "Liferay Workspace EE - AWS"
+    description "Lists built project AMIs available in AWS, for environments: ${environments.join(', ')})"
+
+    doLast {
+        environments.each { environment ->
+            println "The '${environment}' environment of project '${workspaceProjectName}' has " +
+                    "following AMIs in AWS, from newest to oldest:\n"
+
+            def amisByRegion = _getProjectAmisByRegion(environment)
+
+            projectRegions.each { region ->
+                def regionLabel = (region == primaryRegion) ? "${region} (primary)" : region
+                def amis = amisByRegion[region]
+                def indent = '  '
+
+                println "* ${regionLabel}\n"
+
+
+                "         | AMI ID       | In-Use | Over Count | Release # | Created                  | Name ".with { headers ->
+                    println indent + headers
+                    println indent + '-'.multiply(headers.length())
+                }
+
+                // println "         1. | ami-14c6337b | N      |            | 2         | 2016-07-15T14:19:43.000Z | liferay-portal-tomcat-7.0-ce-ga1.dev_20160331161017956-2_amd64.deb/ubuntu/1468591934555
+                // println "   (x)   2. | ami-14c34553 | Y      | Y          | 1         | 2016-07-13T34:34:23.000Z | liferay-portal-tomcat-7.0-ce-ga1.dev_20160331161017956-1_amd64.deb/ubuntu/1468591910658
+
+                amis.eachWithIndex { ami, index ->
+                    def oneBasedIndex = index + 1
+                    def amiOverCount = oneBasedIndex > amisCountToKeep
+
+                    def amiRemovableMarker = !ami.inUse && amiOverCount? '(x)' : '   '
+                    def amiInUseMarker = ami.inUse ? 'Y' : ''
+                    def amiOverMarker = amiOverCount ? 'Y' : ''
+
+                    println indent + " ${amiRemovableMarker} ${oneBasedIndex.toString().padLeft(2)}. | " +
+                            "${ami.id} | ${amiInUseMarker.padRight(6)} | ${amiOverMarker.padRight(10)} | " +
+                            "${ami.releaseNumber.toString().padLeft(9)} | ${ami.creationDate} | ${ami.name}"
+                }
+
+                println()
+            }
+        }
+    }
+}
+
+task removeProjectAmisBeyondRetention {
+    group "Liferay Workspace EE - AWS"
+    description "Removes old ${environments.join(', ')} project AMIs built in AWS (in project's regions ${projectRegions.join(', ')}). " +
+                    "${amisCountToKeep} newest AMIs will be kept."
+
+    mustRunAfter distBundleAmi
+
+    doLast {                                                    
+        def dryRun = false
+
+        environments.each { environment ->
+            _deleteOldProjectAmis(environment, dryRun)
+        }
+
+    }
+}
+
+task removeProjectAmisBeyondRetentionDryRun {
+    group "Liferay Workspace EE - AWS"
+    description "Shows removable old ${environments.join(', ')} project AMIs built in AWS (in project's regions ${projectRegions}). " +
+            "${amisCountToKeep} newest AMIs will be kept. This is a dry-run version of task 'removeAmisBeyondRetention'."
+
+    doLast {
+        def dryRun = true
+
+        environments.each { environment ->
+            _deleteOldProjectAmis(environment, dryRun)
+        }
+    }
+}
+
+// Add possibility to delete orphaned snapshots as well. EC2 Snapshot is not deleted when AMI is deregistered,
+// so there might be plenty orphaned ones:
+//  * https://n2ws.com/how-to-guides/how-to-delete-unutilized-ebs-based-amis-and-corresponding-snapshots.html
+//  * https://github.com/bonclay7/aws-amicleaner
+
+task removeOrphanedSnapshots {
+    group "Liferay Workspace EE - AWS"
+    description "Removes orphaned snapshots in EC2 - created in AWS for AMI which already have been " +
+            "deregistered (in project's regions ${projectRegions}). "
+
+    doLast {
+        def dryRun = false
+        _deleteOrphanedSnapshots(dryRun)
+    }
+}
+
+task removeOrphanedSnapshotsDryRun {
+    group "Liferay Workspace EE - AWS"
+    description "Shows removable orphaned snapshots in EC2 - created in AWS for AMI which already have been " +
+                "deregistered (in project's regions ${projectRegions}). " +
+                "This is a dry-run version of task 'removeOrphanedSnapshots'."
+
+    doLast {
+        def dryRun = true
+        _deleteOrphanedSnapshots(dryRun)
+    }
+}
+
+private AmazonEC2Client _getEc2Client(String region) {
+    assert region
+
+    logger.info "[LWE] Creating EC2 client for ${region}, using credentials '${accessKey}' / ***"
+
+    return AmazonEC2ClientBuilder.standard()
+                    .withCredentials(
+                        new AWSStaticCredentialsProvider(new BasicAWSCredentials(accessKey, secretKey)))
+                    .withRegion(region)
+                    .withClientConfiguration(null)      // no custom config necessary for now
+                    .build()
+}
+
+private AmazonAutoScalingClient _getAsClient(String region) {
+    assert region
+
+    logger.info "[LWE] Creating Autoscaling client for ${region}, using credentials '${accessKey}' / ***"
+
+    return AmazonAutoScalingClientBuilder.standard()
+                    .withCredentials(
+                        new AWSStaticCredentialsProvider(new BasicAWSCredentials(accessKey, secretKey)))
+                    .withRegion(region)
+                    .withClientConfiguration(null)      // no custom config necessary for now
+                    .build()
+}
+
+/**
+ * Removes the olds AMIs build for this project and given environment, which
+ * are bayond retention period.
+ *
+ * @param environment the environment to use to fetch & delete the AMIs
+ * @param dryRun only if set to 'true', the AMIs will actually be removed in AWS;
+ *                  they will only be logged otherwise
+ */
+private void _deleteOldProjectAmis(String environment, boolean dryRun = true) {
+
+    def dry = dryRun ? '[DRY RUN] ' : ''
+
+    println "${dry}Fetching project AMIs in all regions..."
+
+    def amisByRegion = _getProjectAmisByRegion(environment)
+
+    println "${dry}Removing old AMIs for '${environment}' to keep only the latest ${amisCountToKeep} as configured " +
+                "('liferay.workspace.ee.aws.ami.built.amis.retention.count')"
+
+    projectRegions.each { String region ->
+        def amis = amisByRegion[region]
+
+        // do not remove first X AMIs (the configured count to keep)
+        def amisToRemove = amis.drop(amisCountToKeep)
+
+        // TODO add support for amisDaysToKeep - e.g. keep every AMI at least 30 days
+
+        if (amisToRemove.isEmpty()){
+            println "${dry}No old project AMIs to remove for '${environment}' environment " +
+                    "from '${region}' (${amis.size()} retained)"
+        } else {
+            println "${dry}Removing ${amisToRemove.size()} old project AMIs of '${environment}' environment " +
+                    "from '${region}': ${amisToRemove.collect { it.id }}"
+        }
+
+        def ec2Client = _getEc2Client(region)
+
+        GParsPool.withPool {
+            amisToRemove.eachParallel { ProjectAmi amiToRemove ->
+                // for the removable AMIs, check they are not in use
+                if (amiToRemove.inUse) {
+                    println "${dry}  * The AMI '${amiToRemove.id}' cannot be removed, it's currently being used: "
+                    if (amiToRemove.inUseByEc2Instances) {
+                        println "${dry}    * in use by at least one EC2 instance: ${amiToRemove.inUseByEc2Instances.join(', ')}"
+                    }
+                    if (amiToRemove.inUseByLaunchConfigurations) {
+                        println "${dry}    * in use by at least one Launch Configuration: ${amiToRemove.inUseByLaunchConfigurations.join(', ')}"
+                    }
+                }
+                else {
+                    if (dryRun) {
+                        println "${dry}  * The AMI '${amiToRemove.id}' is beyond retention and would now be deregistered and " +
+                                "its snapshots (${amiToRemove.snapshotIds.join(', ')}) deleted"
+                    }
+                    else {
+                        println "${dry}  * deregistering AMI '${amiToRemove.id}' (${amiToRemove.name})..."
+
+                        ec2Client.deregisterImage(new DeregisterImageRequest(amiToRemove.id))
+
+                        amiToRemove.snapshotIds.each { snapshotId ->
+                            println "${dry}  * deleting EBS snapshot '${snapshotId}' used in deregistered AMI '${amiToRemove.id}'..."
+
+                            ec2Client.deleteSnapshot(new DeleteSnapshotRequest(snapshotId))
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Returns the list of AMI ID for this project and currently built environment,
+ * ordered from newest to oldest.
+ * <p>
+ * AMIs are matched based on their name (wild-carded) + tags as added to each AMI
+ * when build for this workspace.
+ *
+ * @param environment the environment to fetch the AMIs for
+ * @return
+ */
+private Map<String, List<ProjectAmi>> _getProjectAmisByRegion(String environment) {
+
+    def getRegionAmis = { String region ->
+        def ec2Client = _getEc2Client(region)
+
+        // no filtering support in the autoscaling API, so fetch all of them, once per region
+        def launchConfigs = _getLaunchConfigurations(region)
+
+        // Filter by name pattern AND tags added by Packer building the AMI, see aws.gradle
+        // This should hopefully eliminate any false positive matches (non-project AMIs fetched)
+
+        // There is no ordering or pagination on the server side
+
+        // We won't use all tags ('Project Version', 'Based On AMI' are also added by Packer)
+
+        logger.info "[LWE] Fetching list of project AMIs in '${region}'"
+
+        def result = ec2Client.describeImages(
+                new DescribeImagesRequest()
+                        .withOwners([ 'self' ])
+                        .withFilters([
+                                new Filter('state', [ 'available' ]),
+                                new Filter('tag:Project', [ workspaceProjectName as String]),
+                                new Filter('tag:Environment', [ environment as String]),
+                                new Filter('tag-key', [ 'Release Number' ])
+                        ])
+        )
+
+        logger.trace "[LWE] Transforming the list of AMIs, ordering by 'creation date desc'"
+
+        return result.images.collect { ami ->
+            List<String> ec2InstancesWhereUsed = _getUsedInEc2Instances(region, ami.imageId)
+            List<String> launchConfigurationsWhereUsed =
+                    launchConfigs.findAll { it.imageId == ami.imageId }.collect { it.launchConfigurationName }
+
+            logger.info "[LWE] AMI '${ami.imageId}' is used by EC2 instances: ${ec2InstancesWhereUsed}"
+            logger.info "[LWE] AMI '${ami.imageId}' is used by AS launch configs: ${launchConfigurationsWhereUsed}"
+
+            new ProjectAmi(
+                    ami.imageId, ami.name,
+                    ami.tags.find { it.key == 'Environment'}?.value,
+                    ami.tags.find { it.key == 'Release Number'}?.value,
+                    ami.creationDate,
+                    ami.blockDeviceMappings.collect { bdm -> bdm?.ebs?.snapshotId }.findAll { it != null },
+                    ec2InstancesWhereUsed,
+                    launchConfigurationsWhereUsed
+            )
+        }.toSorted {
+            // the field as returned from AWS is an ISO 8601 String, like
+            // '2017-01-12T17:03:49.000Z', which can nicely be sorted lexicographically
+            // without conversion to Instant or anything
+            
+            it.creationDate
+        }.reverse()
+    }
+
+    return GParsPool.withPool {
+        // there is no collectEntriesParallel() in GPars, so simulate it
+        projectRegions.collectParallel {
+            String region -> [ region, getRegionAmis(region) ]
+        }.collectEntries { it }
+    }
+}
+
+/**
+ * Returns the list of instance IDs which were started from given AMI and are still 
+ * @param region
+ * @param amiId
+ * @return
+ */
+List<String> _getUsedInEc2Instances(String region, String amiId) {
+    assert region
+    assert amiId
+
+    def ec2Client = _getEc2Client(region)
+
+    // https://docs.aws.amazon.com/cli/latest/reference/ec2/describe-instances.html
+    def result = ec2Client.describeInstances(
+            new DescribeInstancesRequest()
+                    .withFilters([
+                            new Filter('image-id', [ amiId ])
+                    ])
+                    .withMaxResults(1000)
+    )
+
+    // can't imagine we would ever that many in singe AWS account
+    assert result.nextToken == null,
+            "There are more than 1000 instances started from AMI '${amiId}' in region '${region}', which " +
+            "is not supported. Liferay workspace EE must be enhanced to handle this."
+
+    return result.reservations.collectMany { r -> r.instances.collect { it.instanceId } }
+}
+
+/**
+ * Returns the list of instance IDs which were started from given AMI and are still
+ * @param region
+ * @param amiId
+ * @return
+ */
+List<String> _getLaunchConfigurations(String region) {
+    assert region
+    
+    def asClient = _getAsClient(region)
+
+    def result = asClient.describeLaunchConfigurations(
+            new DescribeLaunchConfigurationsRequest()
+                    .withMaxRecords(100))
+
+    // can't imagine we would ever that many in singe AWS account
+    assert result.nextToken == null,
+            "There are mote than 100 launch configurations in region '${region}', which " +
+                    "is not supported. Liferay workspace EE must be enhanced to handle this."
+
+
+    return result.launchConfigurations
+}
+
+
+private void _deleteOrphanedSnapshots(boolean dryRun = true) {
+    def dry = dryRun ? '[DRY RUN] ' : ''
+
+    projectRegions.each { String region ->
+        def ec2Client = _getEc2Client(region)
+
+        println "\n${dry}Fetching AMIs and snapshots in '${region}'..."
+
+        def result = ec2Client.describeImages(
+                new DescribeImagesRequest().withOwners([ 'self' ]))
+
+        def amis = result.images.collect {
+            new Ami(
+                    it.imageId,
+                    it.name,
+                    it.blockDeviceMappings.collect { bdm -> bdm?.ebs?.snapshotId }.findAll { it != null }
+            )
+        }
+
+        def snapshotsToUsedByAmis = amis.collectMany { ami -> ami.snapshotIds.collect { [ it, ami ] } }.collectEntries { it }
+
+        logger.info "[LWE] snapshotsToUsedByAmis (${snapshotsToUsedByAmis.size()}): ${snapshotsToUsedByAmis}"
+
+        // Matched by AMI's description added by AWS when creating new AMI from an EC2 instance (like Packer does it)
+        def newImageSnapshotsResult = ec2Client.describeSnapshots(
+                new DescribeSnapshotsRequest()
+                        .withOwnerIds('self')
+                        .withFilters([
+                            new Filter('status', [ 'completed' ]),
+                            new Filter('description', [ 'Created by CreateImage*' ])
+                        ])
+        )
+
+        // Matched by AMI's description added by AWS when creating new AMI as a copy of another one
+        def copiedImageSnapshotsResult = ec2Client.describeSnapshots(
+                new DescribeSnapshotsRequest()
+                        .withOwnerIds('self')
+                        .withFilters([
+                            new Filter('status', [ 'completed' ]),
+                            new Filter('description', [ 'Copied for DestinationAmi*' ])
+                        ])
+        )
+
+        def snapshotIds = (newImageSnapshotsResult.snapshots + copiedImageSnapshotsResult.snapshots).collect { it.snapshotId }
+
+        if (snapshotIds) {
+            println "${dry}Checking if any of ${snapshotIds.size()} snapshots created for new / copied AMIs could be removed from '${region}', because their matching AMI was already deregistered:"
+        }
+        else {
+            println "${dry}No snapshots created for new / copied AMIs found in region '${region}'"
+        }
+
+        GParsPool.withPool {
+            snapshotIds.eachParallel { snapshotId ->
+                if (snapshotsToUsedByAmis.containsKey(snapshotId)) {
+                    def usedByAmi = snapshotsToUsedByAmis[snapshotId]
+
+                    // old snap-f9e791ae vs. new, longer snap-08f23a1c799b5ed51
+                    println "${dry}  * snapshot ${snapshotId.padRight(22)}: will be kept, since it's used by AMI '${usedByAmi.id}' (${usedByAmi.name})"
+                }
+                else {
+                    if (dryRun) {
+                        println "${dry}  * snapshot ${snapshotId.padRight(22)}: would be removed now, since it's not used by any AMI"
+                    }
+                    else {
+                        println "${dry}  * snapshot ${snapshotId.padRight(22)}: removing it, since not used by any existing AMI any more..."
+
+                        ec2Client.deleteSnapshot(new DeleteSnapshotRequest(snapshotId))
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * A generic AMI.
+ */
+@Immutable
+class Ami {
+    String id
+    String name
+
+    /**
+     * The EBS snapshots associated with this AMI in its block device mappings.
+     */
+    List<String> snapshotIds
+}
+
+/**
+ * An AMI which is the result of a build of workspace ee project (the one produced
+ * by distBundleAmi).
+ */
+@Immutable
+class ProjectAmi {
+    String id
+    String name
+    String environment
+    String releaseNumber
+
+    String creationDate
+
+    /**
+     * The EBS snapshots associated with this AMI in its block device mappings.
+     */
+    List<String> snapshotIds
+
+    List<String> inUseByEc2Instances
+    List<String> inUseByLaunchConfigurations
+
+    boolean isInUse() {
+        return inUseByEc2Instances || inUseByLaunchConfigurations
+    }
+
+}

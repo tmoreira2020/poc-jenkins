@@ -1,0 +1,451 @@
+/*
+ * Copyright (c) 2000-present Liferay, Inc. All rights reserved.
+ *
+ * The contents of this file are subject to the terms of the Liferay Enterprise
+ * Subscription License ("License"). You may not use this file except in
+ * compliance with the License. You can obtain a copy of the License by
+ * contacting Liferay, Inc. See the License for the specific language governing
+ * permissions and limitations under the License, including but not limited to
+ * distribution rights of the Software.
+ */
+
+import de.undercouch.gradle.tasks.download.Download
+import de.undercouch.gradle.tasks.download.Verify
+
+plugins {
+    // https://github.com/michel-kraemer/gradle-download-task
+    id "de.undercouch.download" version '3.1.2'
+}
+
+assert gradle.liferayWorkspaceEe.patchesDownloadBaseUrl.startsWith('https://'),
+            "This should have been checked when reading EE values from gradle.properties"
+
+// Cache the patches' / patching-tool download, follow the pattern of Liferay Workspace Plugin
+// (it downloads bundles into ~/.liferay/bundles).
+// Just to be safe, we compute the cache path base on the base download URLs
+
+def patchesBaseCacheDir =      new File(System.getProperty('user.home'), '.liferay/patches')
+def patchingToolBaseCacheDir = new File(System.getProperty('user.home'), '.liferay/patching-tool')
+
+def urlToCachePath = { url ->
+    return url.replace('https://', '').replace('/', '_')
+}
+
+def patchesCacheDir = new File(
+        patchesBaseCacheDir,
+        urlToCachePath(gradle.liferayWorkspaceEe.patchesDownloadBaseUrl))
+patchesCacheDir.mkdirs()
+
+def patchingToolCacheDir = new File(
+        patchingToolBaseCacheDir,
+        urlToCachePath(gradle.liferayWorkspaceEe.patchesPatchingToolDownloadBaseUrl))
+patchingToolCacheDir.mkdirs()
+
+def distBundleTask = gradle.liferayWorkspaceEe.workspaceTasks.distBundle
+def initBundleTask = gradle.liferayWorkspaceEe.workspaceTasks.initBundle
+
+
+def patchesToDownload = gradle.liferayWorkspaceEe.patchesDownloadAndInstallPatches
+
+def patchFilesNotInCache = patchesToDownload.findAll { String path ->
+            def patchFileInCache = new File(patchesCacheDir, path)
+
+            return !patchFileInCache.exists()
+        }
+
+def basePatchesDownloadUrl = gradle.liferayWorkspaceEe.patchesDownloadBaseUrl
+def patchingToolDownloadBaseUrl = gradle.liferayWorkspaceEe.patchesPatchingToolDownloadBaseUrl
+def patchingToolInstalled = gradle.liferayWorkspaceEe.patchesPatchingToolInstalled
+
+Map patchesDownloadUrlsByPatch =
+        gradle.liferayWorkspaceEe.patchesDownloadAndInstallPatches.collectEntries { String path ->
+            [ "${path}": "${basePatchesDownloadUrl}/${path}" ]
+        }
+
+task downloadPatchingTool(type: Download) {
+    description "Downloads configured specific patching tool to be used, if any"
+    group "Liferay Workspace EE - Patches"
+
+    onlyIf {
+        patchingToolInstalled
+    }
+
+    finalizedBy 'downloadPatchingToolNote'
+
+    src "${patchingToolDownloadBaseUrl}/${patchingToolInstalled}"
+
+    dest patchingToolCacheDir
+
+    // do not try to fetch the file again, if it already exists locally; prevents HTTP
+    // request to given URL, which would always require files.liferay.com credentials
+    overwrite false
+
+    onlyIfNewer true
+
+    username findProperty('downloadPatchesUserName')
+    password findProperty('downloadPatchesPassword')
+
+    // do not 'require' the properties, since we have a nice note task (downloadPatchingToolNote)
+    // explaining what might have went wrong
+}
+
+task unzipDownloadedPatchingTool(type: Copy) {
+    dependsOn downloadPatchingTool
+
+    ext.targetDir = file("${buildDir}/patching-tool-extracted")
+
+    onlyIf {
+        patchingToolInstalled
+    }
+
+    from zipTree(new File(downloadPatchingTool.dest, patchingToolInstalled))
+    into targetDir
+}
+
+task downloadPatches() {
+    ext.downloadTasks = []
+
+    ext.allDownloadsSuccessful = {
+        downloadTasks.count { it.state.failure } == 0
+    }
+}
+
+// Download one by one, since different patches will very likely go into different directory
+// in the cache (e.g. de/* vs. hotfix/* vs. portal/ in 6.2). Also because of the base URL being
+// part of the cache dir (~the top dir in the cache), the dest directory will differ for 6.2 vs. 7.0.
+
+patchesDownloadUrlsByPatch.eachWithIndex { patchPath, downloadUrl, i ->
+    task "downloadPatch${i + 1}" (type: Download) {
+        description "Downloads configured patch #${i + 1} to be installed into Liferay bundles of this workspace."
+        group "Liferay Workspace EE - Patches"
+
+        finalizedBy 'downloadPatchesNote'
+
+        src downloadUrl
+
+        dest new File(patchesCacheDir, patchPath)
+
+        // do not try to fetch the file again, if it already exists locally; prevents HTTP
+        // request to given URL, which would always require files.liferay.com credentials
+        overwrite false
+
+        onlyIfNewer true
+
+        username findProperty('downloadPatchesUserName')
+        password findProperty('downloadPatchesPassword')
+
+        // do not 'require' the properties, since we have a nice note task (downloadPatchesNote)
+        // explaining what might have went wrong
+    }
+
+    downloadPatches.dependsOn "${project.path}:downloadPatch${i + 1}"
+    downloadPatches.downloadTasks << tasks.findByPath("${project.path}:downloadPatch${i + 1}")
+}
+
+
+task downloadPatchesNote() {
+
+    def downloadPatchesDomain = new URL(basePatchesDownloadUrl).host
+
+    onlyIf {
+        !downloadPatches.allDownloadsSuccessful()
+    }
+
+    doLast {
+        // Make sure to give a hint to user if 'downloadPatchN' fails. This task
+        // is finalizing all 'downloadPatchN' ones, so it will run even on the failure
+        // of any 'downloadPatch'
+
+        println """\
+                    |
+                    |NOTE: Make sure to provide valid '${downloadPatchesDomain}' credentials  
+                    |  to Gradle as project properties:
+                    |    * 'downloadPatchesUserName'
+                    |    * 'downloadPatchesPassword'
+                    |  using e.g. init script file (see init.workspace-ee-sample.gradle).
+                    | 
+                    |  Following patches are configured to be downloaded and used in this workspace
+                    |  ('liferay.workspace.ee.patches.download.and.install.patches' 
+                    |  in gradle.properties):
+                    |    * ${patchesDownloadUrlsByPatch.values().join('\n    * ')}
+                    |
+                    |  Following patch files are not cached and need to be downloaded: 
+                    |    * ${patchFilesNotInCache.join('\n    * ')}                  
+                    |
+                    |  You can also download the patches manually and place them into your local cache:
+                    |     ${patchesCacheDir}
+                    |  to make them available to this workspace build.
+                    |""".stripMargin()
+    }
+}
+
+task downloadPatchingToolNote() {
+
+    def downloadPatchingToolDomain = downloadPatchingTool.src.host
+
+    onlyIf {
+        downloadPatchingTool.state.failure != null
+    }
+
+    doLast {
+        // Make sure to give a hint to user if 'downloadPatchingTool' fails. This task
+        // is finalizing the 'downloadPatchingTool', so it will run even on the failure
+        // of it
+
+        println """\
+                    |
+                    |NOTE: Make sure to provide valid '${downloadPatchingToolDomain}' credentials  
+                    |  to Gradle as project properties:
+                    |    * 'downloadPatchesUserName'
+                    |    * 'downloadPatchesPassword'
+                    |  using e.g. init script file (see init.workspace-ee-sample.gradle).
+                    | 
+                    |  Following patching tool is configured to be downloaded and used in this workspace
+                    |  (see 'liferay.workspace.ee.patches.patching.tool.installed' in gradle.properties):
+                    |    * ${patchingToolInstalled}
+                    |
+                    |  You can also download the patching tool from '${patchingToolDownloadBaseUrl}' 
+                    |  manually and place them into your local cache:
+                    |     ${patchingToolCacheDir}
+                    |  to make it available to this workspace build.
+                    |""".stripMargin()
+    }
+}
+
+[ 'Init', 'Dist' ].each { bundleType ->
+
+    def bundlePath = "${rootProject.buildDir}/dist"
+    def workspaceTaskCreatingTheBundle = distBundleTask
+
+    if (bundleType == 'Init') {
+
+        // defaults to '/bundles' in workspace plugin
+        bundlePath = rootProject.file(gradle.liferayWorkspace.homeDir)
+        workspaceTaskCreatingTheBundle = initBundleTask
+    }
+
+    def patchingToolDir = rootProject.file("${bundlePath}/patching-tool")
+
+    task "copyDownloadedPatchingToolInto${bundleType}Bundle" (type: Copy) {
+        description "Copies downloaded patching tool into the bundle produced by ${workspaceTaskCreatingTheBundle}."
+        group "Liferay Workspace EE - Patches"
+
+        // we need to have the bundle extracted to do anything with it + the patching tool in cache
+        dependsOn workspaceTaskCreatingTheBundle, unzipDownloadedPatchingTool
+
+        onlyIf {
+            patchingToolInstalled
+        }
+
+        def targetDir = bundlePath
+
+        from unzipDownloadedPatchingTool.targetDir
+
+        // there will be a top-level directory inside the .zip, called 'patching-tool', so we can
+        // put the contents directly into the root of the bundle
+        into bundlePath
+
+        eachFile { FileCopyDetails f ->
+            println "  * copying '${f.path}'"
+        }
+
+        doFirst {
+            println "Removing files of the existing patching tool from the bundle (lib/*, logs/*, patching-tool.{sh,bat}"
+            
+            new File(bundlePath, 'patching-tool').with {
+                new File(it, 'lib').deleteDir()
+                new File(it, 'logs').deleteDir()
+                new File(it, 'patching-tool.sh').delete()
+                new File(it, 'patching-tool.bat').delete()
+            }
+
+            println "Installing '${patchingToolInstalled}' into the bundle (${rootProject.relativePath(targetDir)}):"
+        }
+    }
+
+    task "copyDownloadedPatchesInto${bundleType}Bundle" (type: Copy) {
+        description "Copies downloaded patches into the bundle produced by ${workspaceTaskCreatingTheBundle}."
+        group "Liferay Workspace EE - Patches"
+
+        // we need to have the bundle extracted to do anything with it + the patches in cache
+        dependsOn workspaceTaskCreatingTheBundle, downloadPatches
+
+        onlyIf {
+            !patchesToDownload.isEmpty()
+        }
+
+        def targetDir = "${bundlePath}/patching-tool/patches"
+
+        from patchesCacheDir
+        into targetDir 
+
+        include patchesToDownload
+
+        // make sure empty directories like 'de' and 'hotfix' are not created and left empty
+        // in target directory
+        includeEmptyDirs false
+
+        eachFile { FileCopyDetails f ->
+
+            // flatten the files as copying
+            if (f.path.contains('/')) {
+                f.path = f.path.substring(f.path.lastIndexOf('/'))
+            }
+
+            println "  * copying '${f.path}'"
+        }
+
+        doFirst {
+            println "Copying downloaded patches into the bundle (${rootProject.relativePath(targetDir)}):"
+        }
+    }
+
+    task "copyProjectPatchesInto${bundleType}Bundle" (type: Copy) {
+        description "Copies patches found in '${rootProject.relativePath(gradle.liferayWorkspaceEe.patchesDir)}' directory into the bundle produced by ${workspaceTaskCreatingTheBundle}."
+        group "Liferay Workspace EE - Patches"
+
+        // we need to have the bundle extracted to do anything with it
+        dependsOn workspaceTaskCreatingTheBundle
+
+        def targetDir = "${bundlePath}/patching-tool/patches"
+
+        from rootProject.file(gradle.liferayWorkspaceEe.patchesDir)
+        into targetDir
+
+        include '*.zip'
+
+        eachFile { FileCopyDetails f ->
+            println "  * copying '${f.path}'"
+        }
+
+        doFirst {
+            println "Copying project patch files into the bundle (${rootProject.relativePath(targetDir)}):"
+        }
+    }
+
+    [ 'info', 'install' ].each { patchingToolCommand ->
+        task "runPatchingTool${patchingToolCommand.capitalize()}In${bundleType}Bundle" (type: Exec) {
+            description "Runs patching-tool command '${patchingToolCommand}' in bundle produced " +
+                    "by ${workspaceTaskCreatingTheBundle}."
+            group "Liferay Workspace EE - Patches"
+
+            onlyIf {
+                downloadPatches.allDownloadsSuccessful()
+            }
+
+            // we need to have the bundle extracted to do anything with it
+            dependsOn workspaceTaskCreatingTheBundle
+
+            dependsOn "copyDownloadedPatchesInto${bundleType}Bundle"
+            dependsOn "copyProjectPatchesInto${bundleType}Bundle"
+            dependsOn "copyDownloadedPatchingToolInto${bundleType}Bundle"
+
+            if (patchingToolCommand == 'install') {
+                finalizedBy "runPatchingToolInfoIn${bundleType}Bundle"
+                finalizedBy "clearLiferayCacheIn${bundleType}Bundle"
+            }
+
+            if (System.getProperty("os.name")?.toLowerCase()?.contains("windows")) {
+                //on windows:
+                commandLine 'cmd', '/c', 'patching-tool.bat', patchingToolCommand
+            } else {
+                //on linux
+                commandLine './patching-tool.sh', patchingToolCommand
+            }
+
+            workingDir patchingToolDir
+
+            doFirst {
+                checkPatchingToolAvailable(patchingToolDir)
+
+                println "Running '${commandLine.join(' ')}' in working directory '${rootProject.relativePath(workingDir)}'..."
+                println ""
+            }
+
+            doLast {
+                println "Finished '${commandLine.join(' ')}'"
+            }
+        }
+    }
+
+    task "clearLiferayCacheIn${bundleType}Bundle" (type: Delete) {
+
+        // we need to have the bundle extracted to do anything with it
+        dependsOn workspaceTaskCreatingTheBundle
+
+        def appServerDirName = gradle.liferayWorkspaceEe.bundleAppServerDirectoryName
+
+        // Based on:
+        //      https://customer.liferay.com/documentation/knowledge-base/-/kb/12361
+        // Also interesting:
+        //      https://issues.liferay.com/browse/LRSUPPORT-15045
+        def dirsToClean = [
+                "${bundlePath}/work",
+                "${bundlePath}/osgi/state",
+
+                "${bundlePath}/${appServerDirName}/work",
+                "${bundlePath}/${appServerDirName}/temp"
+        ]
+
+        delete dirsToClean
+
+        doLast {
+            // re-create all dirs in case Liferay / app server do not create them,
+            // but fails to start without them
+            dirsToClean.each {
+                file(it).mkdirs()
+            }
+        }
+    }
+}
+
+distBundleTask.finalizedBy copyDownloadedPatchingToolIntoDistBundle
+initBundleTask.finalizedBy copyDownloadedPatchingToolIntoInitBundle
+
+def projectPatchFiles = rootProject.file(gradle.liferayWorkspaceEe.patchesDir).list().findAll { it.endsWith('.zip')}
+
+if (!patchesToDownload.isEmpty() || !projectPatchFiles.isEmpty()) {
+    // patches to be installed -> run 'patching-tool install' followed by 'info'
+
+    // TODO is the timing okay? can patching-tool run as the last step when building the bundle?
+
+    distBundleTask.finalizedBy runPatchingToolInstallInDistBundle
+    initBundleTask.finalizedBy runPatchingToolInstallInInitBundle
+}
+else if (patchingToolInstalled) {
+    distBundleTask.finalizedBy runPatchingToolInfoInDistBundle
+    initBundleTask.finalizedBy runPatchingToolInfoInInitBundle
+}
+else {
+    // no patches to be installed and no specific patching tool installed either -> no-op (bundle
+    // might not even have the patching-tool installed)
+
+    task noPatchesNote {
+        doLast {
+            logger.quiet "No patches to install. See 'gradle.workspace-ee-defaults.properties' " +
+                    "for options on how to install patches."
+        }
+    }
+
+    distBundleTask.finalizedBy noPatchesNote
+    initBundleTask.finalizedBy noPatchesNote
+}
+
+/**
+ * Makes sure patching tool is ready to be used in given path inside a bundle.
+ * Throws AssertionError if not.
+ * @param bundlePatchingToolDir
+ */
+def checkPatchingToolAvailable(File bundlePatchingToolDir) {
+    assert bundlePatchingToolDir
+
+    assert bundlePatchingToolDir.exists(),
+            "Patching tool was not installed in the bundle as expected ('${bundlePatchingToolDir}') missing"
+
+    def defaultProfileFile = file("${bundlePatchingToolDir}/default.properties")
+
+    assert defaultProfileFile.exists(),
+            "It seems that default patching-tool profile was not created " +
+                    "in the bundle (file ${defaultProfileFile.absolutePath} is missing). " +
+                    "Please make sure it exists in the bundle used in the workspace."
+}

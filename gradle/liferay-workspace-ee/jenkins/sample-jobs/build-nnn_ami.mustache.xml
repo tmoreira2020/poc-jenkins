@@ -1,0 +1,163 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project>
+  <actions/>
+  <description>Builds 'master' branch for Liferay Workspace sources from GitHub. Produces AMI as the main artifact.
+
+TODO:
+  (1) Make a copy of this job for the environment you want to build, e.g. create a job
+      named 'build-dev_ami'
+
+  (2) Once created, configure the new job
+
+  (3) Search the page (Ctrl / command + F in browser) for every occurrence of 'nnn' and
+      replace it with the name of your environment as created in Liferay Workspace sources,
+      like 'dev'.
+
+  (4) Make sure the job uses same JDK as the bundle built by the workspace
+      - e.g. Oracle JDK 8u144, see gradle/liferay-workspace-ee/ospackage/ospackage.gradle in your workspace
+      - you can set up JDKs in Jenkins in Manage Jenkins -> Global Tool Configuration
+
+  (5) Make sure that in your Liferay Workspace sources (fetched using git),
+      the CloudFormation template to build your app servers is stored in:
+        liferay-in-cloud/nnn/{{ LiferayWorkspaceProjectName }}-nnn...
+      Example:
+        liferay-in-cloud/dev/{{ LiferayWorkspaceProjectName }}-dev-appServers.cloudformation-template.json
+
+      If not, you can update the location in the Shell step below. We just need the template
+      end up in build/ directory.
+
+  (6) Select appropriate credentials. You might need to create them first in your Jenkins:
+      - GitHub credentials
+        * set up Personal token (in GitHub) and store username + the token as password in Jenkins
+      - init scripts for Liferay Workspace
+        * with credentials to download bundle / patches and build AMIs
+        * check 'init.workspace-ee-sample.gradle' in your Workspace sources for guidelines
+  </description>
+  <displayName>SAMPLE build-nnn (AMI)</displayName>
+  <keepDependencies>false</keepDependencies>
+  <properties>
+    <jenkins.model.BuildDiscarderProperty>
+      <strategy class="hudson.tasks.LogRotator">
+        <daysToKeep>-1</daysToKeep>
+        <numToKeep>-1</numToKeep>
+        <artifactDaysToKeep>-1</artifactDaysToKeep>
+        <artifactNumToKeep>10</artifactNumToKeep>
+      </strategy>
+    </jenkins.model.BuildDiscarderProperty>
+    <com.coravy.hudson.plugins.github.GithubProjectProperty plugin="github@1.27.0">
+      <projectUrl>https://github.com/liferay/{{ LiferayWorkspaceProjectName }}/</projectUrl>
+      <displayName/>
+    </com.coravy.hudson.plugins.github.GithubProjectProperty>
+    <EnvInjectJobProperty plugin="envinject@2.1">
+      <info>
+        <propertiesContent>LFR_WORKSPACE_ENV=nnn</propertiesContent>
+        <secureGroovyScript plugin="script-security@1.27">
+          <script/>
+          <sandbox>false</sandbox>
+        </secureGroovyScript>
+        <loadFilesFromMaster>false</loadFilesFromMaster>
+      </info>
+      <on>true</on>
+      <keepJenkinsSystemVariables>true</keepJenkinsSystemVariables>
+      <keepBuildVariables>true</keepBuildVariables>
+      <overrideBuildParameters>false</overrideBuildParameters>
+    </EnvInjectJobProperty>
+  </properties>
+  <scm plugin="git@3.3.0" class="hudson.plugins.git.GitSCM">
+    <configVersion>2</configVersion>
+    <userRemoteConfigs>
+      <hudson.plugins.git.UserRemoteConfig>
+        <name>origin</name>
+        <url>https://github.com/liferay/{{ LiferayWorkspaceProjectName }}.git</url>
+        <credentialsId>75badab3-c953-4649-b133-68654b052e1a</credentialsId>
+      </hudson.plugins.git.UserRemoteConfig>
+    </userRemoteConfigs>
+    <branches>
+      <hudson.plugins.git.BranchSpec>
+        <name>refs/heads/master</name>
+      </hudson.plugins.git.BranchSpec>
+    </branches>
+    <doGenerateSubmoduleConfigurations>false</doGenerateSubmoduleConfigurations>
+    <browser class="hudson.plugins.git.browser.GithubWeb">
+      <url>https://github.com/liferay/{{ LiferayWorkspaceProjectName }}/</url>
+    </browser>
+    <submoduleCfg class="list"/>
+    <extensions>
+      <hudson.plugins.git.extensions.impl.CleanBeforeCheckout/>
+      <hudson.plugins.git.extensions.impl.LocalBranch>
+        <localBranch>**</localBranch>
+      </hudson.plugins.git.extensions.impl.LocalBranch>
+    </extensions>
+  </scm>
+  <canRoam>true</canRoam>
+  <disabled>true</disabled>
+  <blockBuildWhenDownstreamBuilding>false</blockBuildWhenDownstreamBuilding>
+  <blockBuildWhenUpstreamBuilding>false</blockBuildWhenUpstreamBuilding>
+  <jdk>1.8.0_144</jdk>
+  <triggers/>
+  <concurrentBuild>false</concurrentBuild>
+  <builders>
+    <hudson.tasks.Shell>
+      <command># Copy the latest CF template to redeploy app servers from AMI - to make sure it's
+# registered as build artifact and can be grabbed by the deploy job
+mkdir -p build
+cp liferay-in-cloud/${LFR_WORKSPACE_ENV}/{{ LiferayWorkspaceProjectName }}-${LFR_WORKSPACE_ENV}-appServers.cloudformation-template.json build/</command>
+    </hudson.tasks.Shell>
+    <hudson.plugins.gradle.Gradle plugin="gradle@1.26">
+      <switches>-Pliferay.workspace.environment=$LFR_WORKSPACE_ENV
+-PreleaseNumber=$BUILD_NUMBER
+-PpackerExecutable=/opt/liferay/packer/packer
+--no-daemon
+--init-script=$INIT_SCRIPT_SECRETS</switches>
+      <tasks>distBundleAmi</tasks>
+      <rootBuildScriptDir/>
+      <buildFile/>
+      <gradleName>(Default)</gradleName>
+      <useWrapper>true</useWrapper>
+      <makeExecutable>true</makeExecutable>
+      <useWorkspaceAsHome>false</useWorkspaceAsHome>
+      <wrapperLocation/>
+      <passAsProperties>false</passAsProperties>
+    </hudson.plugins.gradle.Gradle>
+  </builders>
+  <publishers>
+    <hudson.tasks.ArtifactArchiver>
+      <artifacts>build/*</artifacts>
+      <allowEmptyArchive>false</allowEmptyArchive>
+      <onlyIfSuccessful>true</onlyIfSuccessful>
+      <fingerprint>true</fingerprint>
+      <defaultExcludes>true</defaultExcludes>
+      <caseSensitive>true</caseSensitive>
+    </hudson.tasks.ArtifactArchiver>
+    <hudson.plugins.git.GitPublisher plugin="git@3.3.0">
+      <configVersion>2</configVersion>
+      <pushMerge>false</pushMerge>
+      <pushOnlyIfSuccess>true</pushOnlyIfSuccess>
+      <forcePush>false</forcePush>
+      <tagsToPush>
+        <hudson.plugins.git.GitPublisher_-TagToPush>
+          <targetRepoName>origin</targetRepoName>
+          <tagName>$BUILD_TAG</tagName>
+          <tagMessage/>
+          <createTag>true</createTag>
+          <updateTag>true</updateTag>
+        </hudson.plugins.git.GitPublisher_-TagToPush>
+      </tagsToPush>
+    </hudson.plugins.git.GitPublisher>
+    <hudson.tasks.Mailer plugin="mailer@1.20">
+      <recipients>{{ NotificationEmail }}</recipients>
+      <dontNotifyEveryUnstableBuild>false</dontNotifyEveryUnstableBuild>
+      <sendToIndividuals>false</sendToIndividuals>
+    </hudson.tasks.Mailer>
+  </publishers>
+  <buildWrappers>
+    <org.jenkinsci.plugins.credentialsbinding.impl.SecretBuildWrapper plugin="credentials-binding@1.11">
+      <bindings>
+        <org.jenkinsci.plugins.credentialsbinding.impl.FileBinding>
+          <credentialsId>15d6946e-02b8-442b-a623-9d591df6a416</credentialsId>
+          <variable>INIT_SCRIPT_SECRETS</variable>
+        </org.jenkinsci.plugins.credentialsbinding.impl.FileBinding>
+      </bindings>
+    </org.jenkinsci.plugins.credentialsbinding.impl.SecretBuildWrapper>
+  </buildWrappers>
+</project>

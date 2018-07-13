@@ -1,0 +1,10 @@
+{
+	"id": "els",
+	"image": "@liferay.workspace.wedeploy.elasticsearch.image@",
+	"cpu": 2,
+	"memory": 6144,
+	"env": {
+		"ES_JAVA_OPTS": "-Xms4g -Xmx4g"
+	},
+	"zeroDowntime": false
+}

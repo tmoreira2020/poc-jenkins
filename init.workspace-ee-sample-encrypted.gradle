@@ -1,0 +1,146 @@
+/*
+ * Copyright (c) 2000-present Liferay, Inc. All rights reserved.
+ *
+ * The contents of this file are subject to the terms of the Liferay Enterprise
+ * Subscription License ("License"). You may not use this file except in
+ * compliance with the License. You can obtain a copy of the License by
+ * contacting Liferay, Inc. See the License for the specific language governing
+ * permissions and limitations under the License, including but not limited to
+ * distribution rights of the Software.
+ */
+
+// Alternatively, you can also read the sensitive properties (passwords) from encrypted
+// Gradle credentials store, using a plugin. For description of individual properties,
+// see:
+//      init.workspace-ee-sample.gradle
+//
+// Based on: https://github.com/etiennestuder/gradle-credentials-plugin
+// Usage:
+//      ./gradlew --init-script=init.gradle --no-daemon addCredentials --key filesDotLiferayDotComPassword
+//      ./gradlew --init-script=init.gradle --no-daemon addCredentials --key oracleDotComPassword
+//      ./gradlew --init-script=init.gradle distBundleZip
+
+// User names and other non-sensitive data can be written in plain text here
+
+allprojects { Project project ->
+    project.ext {
+        downloadBundleUserName    = 'john.doe'
+        downloadPatchesUserName   = 'john.doe'
+        liferayRepositoryUserName = 'john.doe'
+
+        downloadOracleJdkUserName = 'john.doe@email.me'
+
+        awsAccessKey              = 'your AWS ACCESS key'
+        jenkinsUserName           = 'jdoe'
+        
+        packerExecutable          = '/opt/liferay/packer-1.0.0/packer'
+        dockerExecutable          = '/opt/liferay/docker-17/bin/docker'
+    }
+}
+
+initscript {
+    repositories {
+        jcenter()
+    }
+
+    dependencies {
+        classpath 'nu.studer:gradle-credentials-plugin:1.0.1'
+    }
+}
+
+allprojects { Project project ->
+
+    // apply the plugin to the root project only;
+    // properties can be looked up even from child projects (Gradle's default behavior)
+
+    if (project.path == ':') {
+
+        // when applying plugin in init script, you have to use the plugin's
+        // class name, not just the ID
+
+        //    apply plugin: 'nu.studer.credentials'
+        apply plugin: nu.studer.gradle.credentials.CredentialsPlugin
+
+        // Set the sensitive properties used in workspace EE based on their value
+        // in credentials store. Make sure to set not-null value into System properties;
+
+        project.ext {
+
+            // These properties as same across all developer's projects, so they can
+            // be globally stored in credentials store of the developer, under the same key
+
+            downloadBundlePassword    = credentials.filesDotLiferayDotComPassword
+            downloadPatchesPassword   = credentials.filesDotLiferayDotComPassword
+
+            liferayRepositoryPassword = credentials.filesDotLiferayDotComPassword
+
+            downloadOracleJdkPassword = credentials.oracleDotComPassword
+
+            // These are different per-project, so do not store them with the same
+            // key in credentials store!
+            // You'd need to prefix the key, e.g. 'credentials.jarvisAwsSecretKey'
+
+            awsSecretKey    = 'your AWS SECRET key'
+            jenkinsPassword = 'jenkins password or API token'
+        }
+
+
+        ////
+        //// Customization of the 'nu.studer.credentials' plugin
+        ////
+
+        // We want to avoid putting the secret credential's value into command
+        // line history, by using the --value in command like
+        // 'gradle addCredentials --key someKey --value someValue', so instead
+        // ask for the value, if not provided
+
+
+        task askForCredentialValue {
+            group 'Credentials'
+            description 'Used to read the value for a credential key from STDIN if --value is not provided. ' +
+                    'Value will then not be stored in e.g. Bash history.'
+
+            // we want to avoid putting the secret credential's value into command
+            // line history, by using the --value in command like
+            // 'gradle addCredentials --key someKey --value someValue', so instead
+            // ask for the value, if not provided
+
+            onlyIf {
+                // only ask for the value if it was not provided, with e.g. '--value' on command line
+                !addCredentials.credentialsValue
+            }
+
+            doLast {
+                // based on: https://mrhaki.blogspot.cz/2010/09/gradle-goodness-get-user-input-values.html
+
+                def console = System.console()
+
+                if (console) {
+                    println "> ### Please enter your secret value for key " +
+                            "'${addCredentials.credentialsKey}' and hit ENTER: ###"
+
+                    def password = console.readPassword()
+
+                    // 'credentialsValue' is a project property read by 'addCredentials' task
+                    // in execution phase, by default based on --value command line argument
+                    project.ext.credentialsValue = password.toString()
+                } else {
+                    throw new GradleException(
+                            "Cannot get console (to read from STDIN), are you using Gradle daemon? " +
+                                    "Make sure to use --no-daemon (or equivalent setting) - we need " +
+                                    "Gradle to be interactive in order to read secret value from STDIN.")
+                }
+            }
+        }
+
+        addCredentials {
+            dependsOn askForCredentialValue
+
+            doLast {
+                if (it.state.failure == null) {
+                    println "Successfully added encrypted value for key '${credentialsKey}' into credentials store"
+                }
+            }
+        }
+    }
+}

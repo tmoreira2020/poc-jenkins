@@ -1,0 +1,51 @@
+version: '3.3'
+services:
+
+  dba:
+    image: "@liferay.workspace.wedeploy.database.image@"
+    environment:
+      - MYSQL_ROOT_PASSWORD=mypassw0rd
+      - MYSQL_DATABASE=lportal
+    volumes:
+      - type: bind
+        source: ./dba
+        target: /wedeploy-container
+
+  els:
+    image: "@liferay.workspace.wedeploy.elasticsearch.image@"
+    environment:
+      - discovery.type=single-node
+      - cluster.routing.allocation.disk.threshold_enabled=false
+    volumes:
+      - type: bind
+        source: ./els
+        target: /wedeploy-container
+
+  lfr:
+    image: "@liferay.workspace.wedeploy.liferay.image@"
+    environment:
+      - LIFERAY_WEB_PERIOD_SERVER_PERIOD_HTTP_PERIOD_PORT=8080
+    volumes:
+      - type: volume
+        source: lfrdata
+        target: /opt/liferay/data
+      - type: bind
+        source: ./lfr
+        target: /wedeploy-container
+    depends_on:
+      - dba
+      - els
+
+  pxy:
+    image: "@liferay.workspace.wedeploy.proxy.image@"
+    ports:
+      - "0.0.0.0:8080:80"
+    links:
+      - "lfr"
+    volumes:
+      - type: bind
+        source: ./pxy
+        target: /wedeploy-container
+
+volumes:
+  lfrdata:
