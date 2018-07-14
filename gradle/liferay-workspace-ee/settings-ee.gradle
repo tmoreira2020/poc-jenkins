@@ -36,6 +36,7 @@ include 'liferay-workspace-ee:ospackage'
 include 'liferay-workspace-ee:docker'
 include 'liferay-workspace-ee:patches'
 include 'liferay-workspace-ee:upgrade-workspace-ee'
+include 'liferay-workspace-ee:wedeploy'
 
 def rootEeProject = project(":liferay-workspace-ee")
 assert rootEeProject.parent == rootProject
