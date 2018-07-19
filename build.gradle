@@ -1,0 +1,4 @@
+// TODO specify the version of your project, it's used to name your artifacts;
+// '0.0.0' will be used in workspace EE if not set explicitly
+
+// version = '1.0.0'

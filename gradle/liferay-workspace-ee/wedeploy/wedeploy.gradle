@@ -22,7 +22,7 @@ task collectOsgiConfigs(type: Copy) {
     from "${gradle.liferayWorkspace.configsDir}/${gradle.liferayWorkspace.environment}/${service}/config"
     from "${gradle.liferayWorkspace.configsDir}/common/${service}/config"
 
-    into "${rootProject.buildDir}/wedeploy/${service}/osgi-configs"
+    into "${rootProject.buildDir}/wedeploy/${service}/config"
 
     include '*.cfg'
     include '*.config'
@@ -48,7 +48,7 @@ task collectPropertiesFiles(type: Copy) {
     from "${gradle.liferayWorkspace.configsDir}/${gradle.liferayWorkspace.environment}/${service}/"
     from "${gradle.liferayWorkspace.configsDir}/common/${service}/"
 
-    into "${rootProject.buildDir}/wedeploy/${service}/"
+    into "${rootProject.buildDir}/wedeploy/${service}/config"
 
     include '*.properties'
 
